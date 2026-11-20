@@ -148,12 +148,21 @@ const gcEnabled = false;
 
 // The local cache of ydocs
 const docs = new Map();
+const sourceStorageTails = new WeakMap();
+const sourcePurgeRetries = new WeakSet();
+const discardingRooms = new Map();
+const retiredConnections = new WeakSet();
+const freshHibernationConnections = new WeakSet();
+const pendingFlushReplies = new WeakMap();
 
 const messageSync = 0;
 const messageAwareness = 1;
 export const messageFlushRequest = 2;
 export const messageFlushResponse = 3;
 const ERROR_ORIGIN = Symbol('error-notification');
+const FENCED_SOURCE_ETAG = 'fencedSourceEtag';
+const FENCED_SOURCE_SESSION = 'fencedSourceSession';
+const RELOAD_CLOSE = { code: 4412, reason: 'reload required' };
 const MAX_STORAGE_KEYS = 128;
 const MAX_STORAGE_VALUE_SIZE = 131072;
 
@@ -197,6 +206,25 @@ function getDocType(docName) {
   return 'html'; // default
 }
 
+function isBranchSource(docName) {
+  const { pathname } = new URL(docName, 'https://admin.da.live');
+  return /^\/(?:api\/)?source\/[^/]+\/[^/]*(?:~|%7e)/i.test(pathname);
+}
+
+const isFencedSource = (ydoc, docName = ydoc.name ?? '') => !isHelixDoc(docName, ydoc)
+  && (ydoc.sourceFenced || isBranchSource(docName));
+
+const hasSourceValidator = (etag) => typeof etag === 'string' && etag !== '' && etag !== '*';
+
+function removeRoom(doc) {
+  if (docs.get(doc.name) === doc) {
+    docs.delete(doc.name);
+  }
+  if (!doc.isDestroyed) {
+    doc.destroy();
+  }
+}
+
 /**
  * Close the WebSocket connection for a document. If there are no connections left, remove
  * the ydoc from the local cache map.
@@ -209,6 +237,7 @@ export const closeConn = async (doc, conn, skipSave = false, closeOptions = unde
   try {
     if (doc.conns.has(conn)) {
       const controlledIds = doc.conns.get(conn);
+      retiredConnections.add(conn);
       doc.conns.delete(conn);
       try {
         awarenessProtocol.removeAwarenessStates(doc.awareness, Array.from(controlledIds), null);
@@ -231,15 +260,17 @@ export const closeConn = async (doc, conn, skipSave = false, closeOptions = unde
             logError(err, '[docroom] Failed to flush on last connection close', doc.name, err);
           }
         }
-        const duration = conn.connectedAt ? Date.now() - conn.connectedAt : 0;
-        // eslint-disable-next-line no-console
-        console.log('[docroom] Last connection closed', doc.name, `duration: ${duration}ms`, `unsaved: ${!!doc.hasClientChanged}`);
-        doc.destroy();
-        docs.delete(doc.name);
+        if (doc.conns.size === 0) {
+          const duration = conn.connectedAt ? Date.now() - conn.connectedAt : 0;
+          // eslint-disable-next-line no-console
+          console.log('[docroom] Last connection closed', doc.name, `duration: ${duration}ms`, `unsaved: ${!!doc.hasClientChanged}`);
+          removeRoom(doc);
+        }
       }
     }
-    if (closeOptions) {
-      conn.close(closeOptions.code, closeOptions.reason);
+    const options = closeOptions ?? doc.reloadCloseOptions;
+    if (options) {
+      conn.close(options.code, options.reason);
     } else {
       conn.close();
     }
@@ -269,9 +300,10 @@ const send = (doc, conn, m) => {
  * in storeState function.
  * @param {string} docName - The document name
  * @param {TransactionalStorage} storage - The worker transactional storage
+ * @param {boolean} clearOnMismatch - Whether to clear storage for a mismatched document name.
  * @returns {Promise<Uint8Array | undefined>} - The stored state or undefined if not found
  */
-export const readState = async (docName, storage) => {
+export const readState = async (docName, storage, clearOnMismatch = true) => {
   const storedDoc = await storage.get('doc');
   if (storedDoc === undefined) {
     // eslint-disable-next-line no-console
@@ -281,8 +313,10 @@ export const readState = async (docName, storage) => {
 
   if (storedDoc !== docName) {
     // eslint-disable-next-line no-console
-    console.log('[docroom] Docname mismatch in persistence. Expected:', docName, 'found:', storedDoc, 'Deleting storage');
-    await storage.deleteAll();
+    console.log('[docroom] Docname mismatch in persistence. Expected:', docName, 'found:', storedDoc);
+    if (clearOnMismatch) {
+      await storage.deleteAll();
+    }
     return undefined;
   }
 
@@ -336,8 +370,17 @@ export const readState = async (docName, storage) => {
  * @param {Uint8Array} state - The Yjs document state, as produced by Y.encodeStateAsUpdate()
  * @param {TransactionalStorage} storage - The worker transactional storage
  * @param {number} chunkSize - The chunk size
+ * @param {string|null} [sourceEtag] - Exact Source validator for this snapshot (null = unverified).
+ * @param {string} [sourceSession] - Socket continuity identity for a fenced snapshot.
  */
-export const storeState = async (docName, state, storage, chunkSize = MAX_STORAGE_VALUE_SIZE) => {
+export const storeState = async (
+  docName,
+  state,
+  storage,
+  chunkSize = MAX_STORAGE_VALUE_SIZE,
+  sourceEtag = undefined,
+  sourceSession = undefined,
+) => {
   const oldChunkCount = await storage.get('chunks');
 
   let serialized;
@@ -354,7 +397,10 @@ export const storeState = async (docName, state, storage, chunkSize = MAX_STORAG
       serialized[`chunk_${j}`] = state.slice(i, i + chunkSize);
     }
 
-    if (j >= MAX_STORAGE_KEYS) {
+    // Keep the validator and session identity atomic with the snapshot.
+    const maxChunks = MAX_STORAGE_KEYS - (sourceEtag === undefined ? 1 : 3)
+      - Number(sourceSession !== undefined);
+    if (j > maxChunks) {
       // eslint-disable-next-line no-console
       console.error('[docroom] Object too big for worker storage', docName, j, MAX_STORAGE_KEYS);
       throw new Error('Object too big for worker storage');
@@ -368,9 +414,72 @@ export const storeState = async (docName, state, storage, chunkSize = MAX_STORAG
     }
   }
   serialized.doc = docName;
+  if (sourceEtag !== undefined) {
+    serialized[FENCED_SOURCE_ETAG] = sourceEtag;
+  }
+  if (sourceSession !== undefined) {
+    serialized[FENCED_SOURCE_SESSION] = sourceSession;
+  }
 
   await storage.put(serialized);
 };
+
+// Serialize Source snapshots and invalidation markers for this DO.
+function queueSourceStorage(ydoc, operation) {
+  const { storage, name } = ydoc;
+  const previous = sourceStorageTails.get(storage) ?? Promise.resolve();
+  const next = previous.then(operation);
+  sourceStorageTails.set(storage, next.catch((err) => {
+    logError(err, '[docroom] Failed to persist Source state', name, err);
+  }));
+  return next;
+}
+
+function storeSourceState(ydoc, docName = ydoc.name) {
+  return queueSourceStorage(ydoc, () => {
+    if (docs.get(docName) === ydoc && !ydoc.discardPendingChanges) {
+      let sourceEtag;
+      if (isFencedSource(ydoc, docName)) {
+        if (ydoc.etagUnverified) {
+          return undefined;
+        }
+        sourceEtag = ydoc.etag;
+      }
+      const state = Y.encodeStateAsUpdate(ydoc);
+      return storeState(docName, state, ydoc.storage, undefined, sourceEtag, ydoc.sourceSession);
+    }
+    return undefined;
+  });
+}
+
+function purgeSourceState(ydoc) {
+  const { storage } = ydoc;
+  return queueSourceStorage(ydoc, async () => {
+    // Null records durable opt-in but cannot authorize any stored Yjs state.
+    // If even this write fails, retry before trusting a snapshot in this isolate.
+    sourcePurgeRetries.add(storage);
+    await storage.put(FENCED_SOURCE_ETAG, null);
+    const chunks = await storage.get('chunks');
+    await storage.delete(['doc', 'docstore', 'chunks', 'lastsync', FENCED_SOURCE_SESSION]);
+    if (chunks) {
+      await storage.delete(Array.from({ length: chunks }, (_, i) => `chunk_${i}`));
+    }
+    sourcePurgeRetries.delete(storage);
+  });
+}
+
+async function readSourceBaseline(ydoc, docName, storage) {
+  try {
+    return await storage.get(FENCED_SOURCE_ETAG);
+  } catch (error) {
+    if (isFencedSource(ydoc, docName) || !storage.list) {
+      throw error;
+    }
+    // Legacy storage recovery can continue if another read establishes whether a marker exists.
+    const markers = await storage.list({ prefix: FENCED_SOURCE_ETAG, limit: 1 });
+    return markers.get(FENCED_SOURCE_ETAG);
+  }
+}
 
 export const showError = (ydoc, err) => {
   try {
@@ -390,6 +499,51 @@ export const showError = (ydoc, err) => {
   }
 };
 
+function discardRoom(ydoc, error) {
+  const { name, storage } = ydoc;
+  const fencedSource = isFencedSource(ydoc);
+  const notification = error ?? (fencedSource
+    ? new Error('Room invalidated; reload the document') : undefined);
+  // Fence synchronously before broadcasting anything: send() can re-enter closeConn.
+  // The promise covers storage and socket close, never the active Source save.
+  // eslint-disable-next-line no-param-reassign
+  ydoc.discardPendingChanges = true;
+  ydoc.cancelSave?.();
+  if (fencedSource) {
+    // eslint-disable-next-line no-param-reassign
+    ydoc.lastSaveError = notification;
+    // Also use 4412 if sending the error re-enters closeConn.
+    // eslint-disable-next-line no-param-reassign
+    ydoc.reloadCloseOptions = RELOAD_CLOSE;
+  }
+  ydoc.conns.forEach((_, conn) => retiredConnections.add(conn));
+  const cleanup = Promise.resolve().then(async () => {
+    try {
+      if (fencedSource && storage?.put) {
+        await purgeSourceState(ydoc);
+      } else if (error && !isHelixDoc(name, ydoc) && storage?.deleteAll) {
+        // Legacy DA reports deletion as 412; leave its close behavior unchanged.
+        await queueSourceStorage(ydoc, () => storage.deleteAll());
+      } else {
+        await storage?.delete?.('lastsync');
+      }
+    } finally {
+      discardingRooms.delete(name);
+    }
+  });
+  discardingRooms.set(name, cleanup);
+  if (notification) {
+    showError(ydoc, notification);
+  }
+  if (ydoc.lastSaveError) {
+    pendingFlushReplies.get(ydoc)?.forEach((reply) => reply(ydoc.lastSaveError));
+  }
+  // skipSave means closeConn never awaits this save or the storage queue.
+  const closing = Array.from(ydoc.conns.keys(), (conn) => closeConn(ydoc, conn, true));
+  removeRoom(ydoc);
+  return Promise.all([cleanup, ...closing]);
+}
+
 /**
  * Invalidate the worker storage for the document, which will ensure that when accessed
  * the worker will fetch the latest version of the document from the da-admin.
@@ -397,6 +551,7 @@ export const showError = (ydoc, err) => {
  * cause it to be reinitialised when accessed.
  * @param {string} docName - The name of the document
  * @param {boolean} discardPendingChanges - cancel pending saves instead of flushing them.
+ *   Fenced Source rooms always discard on an external invalidation.
  * @returns true if the document was found and invalidated, false otherwise.
  */
 export const invalidateFromAdmin = async (docName, discardPendingChanges = false) => {
@@ -404,23 +559,15 @@ export const invalidateFromAdmin = async (docName, discardPendingChanges = false
   console.log('[worker] Invalidate document cache', docName);
   const ydoc = docs.get(docName);
   if (ydoc) {
-    if (discardPendingChanges) {
-      ydoc.discardPendingChanges = true;
-      ydoc.cancelSave?.();
+    if (discardPendingChanges || isFencedSource(ydoc)) {
+      await discardRoom(ydoc);
+      return true;
     }
-    // Remove the restore anchor before reconnecting, including when an external
-    // replacement has identical content but must discard stored pending edits.
-    const discardAnchor = discardPendingChanges && ydoc.storage?.delete
-      ? ydoc.storage.delete('lastsync')
-      : undefined;
     // Await all closeConn calls so that flushSave + docs.delete complete before
     // this function returns. Without this, an editor that reconnects during the
     // flushSave window finds the stale ydoc still in `docs` and reuses it
     // instead of creating a fresh one that loads the new da-admin content.
-    await Promise.all([
-      discardAnchor,
-      ...Array.from(ydoc.conns.keys()).map((c) => closeConn(ydoc, c, discardPendingChanges)),
-    ]);
+    await Promise.all(Array.from(ydoc.conns.keys(), (c) => closeConn(ydoc, c)));
     return true;
   } else {
     // eslint-disable-next-line no-console
@@ -492,8 +639,7 @@ export const persistence = {
    * @param {string} docName - The document name
    * @param {string} auth - The authorization header
    * @param {WSSharedDoc} ydoc - the ydoc; provides the da-admin service binding
-   *   (`ydoc.daadmin`). Helix documents also receive a normalized ETag
-   *   (`ydoc.etag`) for protected saves and HEAD-based change detection.
+   *   (`ydoc.daadmin`). Store the exact Source ETag, or the normalized Helix ETag.
    * @returns {Promise<string>} - The content of the document
    * @throws {Error} - If the document cannot be retrieved (including 404)
    */
@@ -518,6 +664,15 @@ export const persistence = {
       if (isHelix) {
         // eslint-disable-next-line no-param-reassign
         ydoc.etag = etag;
+      } else {
+        const sourceEtag = initialReq.headers.get('etag');
+        // ETags alone do not distinguish legacy DA and branching-enabled Source.
+        // eslint-disable-next-line no-param-reassign
+        ydoc.sourceFenced = isFencedSource(ydoc, docName) || initialReq.headers.has('Content-Branch');
+        // eslint-disable-next-line no-param-reassign
+        ydoc.etagUnverified = ydoc.sourceFenced && !hasSourceValidator(sourceEtag);
+        // eslint-disable-next-line no-param-reassign
+        ydoc.etag = sourceEtag;
       }
       return docType === 'json' ? initialReq.json() : initialReq.text();
     } else {
@@ -564,12 +719,13 @@ export const persistence = {
       return { ok: true };
     }
 
-    const storedEtag = isHelix ? normalizeEtag(ydoc.etag) : null;
-    if (isHelix && (!storedEtag || storedEtag === '*' || ydoc.etagUnverified)) {
-      throw new Error('Cannot save Helix document without a verified ETag; reload the document');
+    const storedEtag = isHelix ? normalizeEtag(ydoc.etag) : ydoc.etag;
+    const legacy = !isHelix && !isFencedSource(ydoc);
+    if (!legacy && (!storedEtag || storedEtag === '*' || ydoc.etagUnverified)) {
+      throw new Error(`Cannot save ${isHelix ? 'Helix' : 'Source'} document without a verified ETag; reload the document`);
     }
     const headers = {
-      'If-Match': isHelix ? storedEtag : '*',
+      'If-Match': legacy ? '*' : storedEtag,
       'X-DA-Initiator': 'collab',
       ...bodyHeaders,
     };
@@ -602,6 +758,7 @@ export const persistence = {
       // eslint-disable-next-line no-param-reassign
       ydoc.pendingPuts = (ydoc.pendingPuts ?? 0) + 1;
     }
+    const cached = docs.get(ydoc.name) === ydoc;
     let response;
     try {
       response = await backend.fetch(ydoc.name, opts);
@@ -615,15 +772,19 @@ export const persistence = {
       ok, status, statusText, body, headers: respHeaders,
     } = response;
 
-    if (ok && isHelix) {
+    const stillCurrent = !ydoc.discardPendingChanges && (!cached || docs.get(ydoc.name) === ydoc);
+    if (ok && stillCurrent && !legacy) {
       const etag = respHeaders.get('etag');
+      if (isHelix || hasSourceValidator(etag)) {
+        // eslint-disable-next-line no-param-reassign
+        ydoc.etag = isHelix ? normalizeEtag(etag) : etag;
+      }
+      // A missing validator after a protected write is not evidence of a legacy backend.
       // eslint-disable-next-line no-param-reassign
-      ydoc.etag = normalizeEtag(etag);
-      // eslint-disable-next-line no-param-reassign
-      ydoc.etagUnverified = !etag;
-      if (!etag) {
+      ydoc.etagUnverified = !hasSourceValidator(etag);
+      if (ydoc.etagUnverified) {
         // eslint-disable-next-line no-console
-        console.warn('[docroom] Helix save response missing ETag; protected saves require a reload', ydoc.name);
+        console.warn(`[docroom] ${isHelix ? 'Helix' : 'Source'} save response missing ETag; protected saves require a reload`, ydoc.name);
       }
     }
 
@@ -750,13 +911,22 @@ export const persistence = {
    */
   update: async (ydoc, current, docName) => {
     const docType = getDocType(docName);
-    const isHelix = isHelixDoc(docName, ydoc);
-    if (isHelix) {
-      // eslint-disable-next-line no-param-reassign
-      ydoc.lastSaveError = null;
-    }
+    const name = ydoc.name ?? docName;
+    const cached = docs.get(name) === ydoc;
+    const roomIsCurrent = () => !ydoc.discardPendingChanges && !ydoc.isDestroyed
+      && (!cached || docs.get(name) === ydoc);
+    const complete = (value) => {
+      if (roomIsCurrent()) {
+        // eslint-disable-next-line no-param-reassign
+        ydoc.lastSaveError = null;
+      }
+      return value;
+    };
     let closeAll = false;
     try {
+      if (!roomIsCurrent()) {
+        throw new Error('Room invalidated before saving; reload the document');
+      }
       const content = docType === 'json' ? doc2json(ydoc) : doc2aem(ydoc);
 
       // Never overwrite real content with the deterministic empty stub when no
@@ -766,38 +936,30 @@ export const persistence = {
       if (!ydoc.hasClientChanged && content.length <= EMPTY_DOC_SIZE) {
         // eslint-disable-next-line no-console
         console.log('[docroom] Skipping empty-stub PUT - no client edit', docName, content.length);
-        return current;
+        return complete(current);
       }
 
       if (current !== content) {
         // Only store the document if it was actually changed.
         const { ok, status, statusText } = await persistence.put(ydoc, content);
+        if (!roomIsCurrent()) {
+          throw new Error('Room invalidated before the save completed; reload the document');
+        }
 
         if (!ok) {
-          if (status === 412 && isHelix) {
-            const conflict = new Error('412 - Helix document changed externally; reloading the document');
+          if (status === 412) {
+            const backend = isHelixDoc(name, ydoc) ? 'Helix' : 'Source';
+            const conflict = new Error(`412 - ${backend} document changed externally; reloading the document`);
             // eslint-disable-next-line no-param-reassign
             ydoc.lastSaveError = conflict;
             // eslint-disable-next-line no-console
-            console.warn('[docroom] Helix version conflict', docName, conflict.message);
-            showError(ydoc, conflict);
-            await invalidateFromAdmin(docName, true);
+            console.warn(`[docroom] ${backend} version conflict`, docName, conflict.message);
+            if (docs.get(name) === ydoc) {
+              await discardRoom(ydoc, conflict);
+            }
             return current;
           }
-          if (status === 412) {
-            // Document doesn't exist - clean up cached state
-            if (ydoc.storage) {
-              try {
-                await ydoc.storage.deleteAll();
-                // eslint-disable-next-line no-console
-                console.log('[docroom] Cleaned worker storage after 412 (document deleted)');
-              } catch (storageErr) {
-                // eslint-disable-next-line no-console
-                console.error('[docroom] Failed to clean storage', storageErr);
-              }
-            }
-          }
-          closeAll = (status === 401 || status === 403 || status === 412);
+          closeAll = (status === 401 || status === 403);
           throw new Error(`${status} - ${statusText}`);
         }
 
@@ -806,14 +968,26 @@ export const persistence = {
         // Record what we just PUT so that on DO restart we can tell whether
         // CF storage is ahead of da-admin (safe to use) vs. da-admin was
         // externally modified (must use da-admin).
-        await safePutLastsync(ydoc.storage, content, docName, 'after da-admin PUT');
-        return content;
+        if (isFencedSource(ydoc) && ydoc.storage?.put && cached) {
+          if (ydoc.etagUnverified) {
+            await purgeSourceState(ydoc);
+          } else {
+            await storeSourceState(ydoc);
+          }
+        } else {
+          await safePutLastsync(ydoc.storage, content, docName, 'after da-admin PUT');
+        }
+        return complete(content);
       }
+      return complete(current);
     } catch (err) {
-      if (isHelix) {
+      if (!roomIsCurrent()) {
         // eslint-disable-next-line no-param-reassign
-        ydoc.lastSaveError = err;
+        ydoc.lastSaveError ??= err;
+        return current;
       }
+      // eslint-disable-next-line no-param-reassign
+      ydoc.lastSaveError = err;
       if (err?.message?.startsWith('401')) {
         // eslint-disable-next-line no-console
         console.warn('[docroom] Failed to update document', docName, err.message);
@@ -825,6 +999,9 @@ export const persistence = {
         console.error('[docroom] Failed to update document', docName, err);
       }
       showError(ydoc, err);
+      if (closeAll) {
+        pendingFlushReplies.get(ydoc)?.forEach((reply) => reply(err));
+      }
     }
     if (closeAll) {
       // We had an unauthorized from da-admin - lets reset the connections.
@@ -856,20 +1033,54 @@ export const persistence = {
 
     let current;
     let restored = false; // True if restored from worker storage
+    let restoredSession;
     let freshRoom = false;
     let restoreAfterDelay;
     let restoreError;
     let backendRestored = false;
+    const cached = docs.get(docName) === ydoc;
 
     // Get document from da-admin (throws on error including 404)
     const timingBeforeDaAdminGet = Date.now();
     current = await persistence.get(docName, conn.auth, ydoc);
     const timingDaAdminGetDuration = Date.now() - timingBeforeDaAdminGet;
+    const roomIsCurrent = () => !ydoc.discardPendingChanges && !ydoc.isDestroyed
+      && (!cached || docs.get(docName) === ydoc);
+    if (!roomIsCurrent()) {
+      return new Map();
+    }
 
-    // Read the stored state from internal worker storage (errors are non-fatal)
+    let sourceEtag;
+    if (!isHelix) {
+      await sourceStorageTails.get(storage);
+      if (!roomIsCurrent()) {
+        return new Map();
+      }
+      if (sourcePurgeRetries.has(storage)) {
+        await purgeSourceState(ydoc);
+      }
+      // Failing to read the opt-in marker must not silently select wildcard mode.
+      sourceEtag = await readSourceBaseline(ydoc, docName, storage);
+      if (sourceEtag !== undefined) {
+        // eslint-disable-next-line no-param-reassign
+        ydoc.sourceFenced = true;
+        // eslint-disable-next-line no-param-reassign
+        ydoc.etagUnverified = !hasSourceValidator(ydoc.etag);
+      }
+    }
+    const fencedSource = isFencedSource(ydoc, docName);
+    const requiresSourceRestore = isHelix || fencedSource;
+
+    // Read the stored state from internal worker storage (snapshot errors are non-fatal).
     try {
       const timingBeforeReadState = Date.now();
-      const stored = await readState(docName, storage);
+      const verifiedSnapshot = hasSourceValidator(sourceEtag) && sourceEtag === ydoc.etag
+        && !ydoc.etagUnverified;
+      const stored = !fencedSource || verifiedSnapshot
+        ? await readState(docName, storage, !fencedSource) : undefined;
+      if (!roomIsCurrent()) {
+        return new Map();
+      }
       timingReadStateDuration = Date.now() - timingBeforeReadState;
       if (isHelix && !stored?.length) {
         const [storedDoc, lastSynced] = await Promise.all([
@@ -879,47 +1090,57 @@ export const persistence = {
       }
 
       if (stored && stored.length > 0) {
+        if (fencedSource) {
+          restoredSession = await storage.get(FENCED_SOURCE_SESSION);
+          if (!roomIsCurrent()) {
+            return new Map();
+          }
+        }
         Y.applyUpdate(ydoc, stored);
 
-        // CF storage is valid to use if da-admin still has the same content as the
-        // last successful sync — meaning CF storage is either in sync with or ahead
-        // of da-admin (unsaved pending changes built on top of it).
-        // Using CF storage preserves those pending changes.
-        // If da-admin was externally modified since the last sync, lastSynced !==
-        // current, so we fall back to da-admin (external edit wins).
-        //
-        // NOTE: we intentionally do NOT call doc2aem/doc2json here. Those are
-        // synchronous serialisers that can block the CF event loop for an extended
-        // time when the stored ydoc state is large or structurally unexpected,
-        // causing the DO to be terminated before bindState completes.
-        // The lastsync anchor alone is sufficient to determine validity.
-        const lastSynced = storage.get ? await storage.get('lastsync') : undefined;
-        if (lastSynced === current) {
+        // The exact Source validator proves which revision pending edits were based on.
+        // For Helix and legacy DA, retain their existing content-based anchor. Avoid
+        // serializing cached Yjs here: malformed state can block the event loop.
+        const validSnapshot = fencedSource || await storage.get('lastsync') === current;
+        if (validSnapshot) {
           restored = true;
           // eslint-disable-next-line no-console
-          console.log('[docroom] Restored from worker persistence', docName, '(lastsync matches da-admin)');
+          console.log('[docroom] Restored from worker persistence', docName, '(matches backend baseline)');
         }
       }
     } catch (error) {
+      if (!roomIsCurrent()) {
+        return new Map();
+      }
       logError(error, '[docroom] Problem restoring state from worker storage', error);
       if (!isExpectedPlatformEvent(error)) {
         showError(ydoc, error);
       }
     }
-
-    if (!restored && current) {
+    if (!roomIsCurrent()) {
+      return new Map();
+    }
+    if (fencedSource) {
+      // Reuse an identity only if the corresponding Yjs snapshot was verified and applied.
+      const resume = restored && typeof restoredSession === 'string' && restoredSession !== '';
+      // eslint-disable-next-line no-param-reassign
+      ydoc.sourceSession = resume ? restoredSession : crypto.randomUUID();
+      if (restored && !resume) {
+        await storeSourceState(ydoc, docName);
+      }
+    }
+    if (!restored && (current || requiresSourceRestore)) {
       // The doc was not restored from worker persistence, so read it from da-admin.
-      // Keep untrusted Helix state until its replacement is durable: a restart
-      // during the delay must not mistake a reconnect for a fresh room.
-      if (!isHelix && storage.deleteAll) {
+      if (fencedSource) {
+        await purgeSourceState(ydoc);
+      } else if (!requiresSourceRestore && storage.deleteAll) {
         await storage.deleteAll();
       }
       // eslint-disable-next-line no-console
       console.log('[docroom] Could not be restored, trying to restore from da-admin', docName);
 
-      // da-admin preserves client-first restores (e.g. a replaced image FPO).
-      // Cached Helix state without a matching anchor must reload: a reconnect
-      // can replay obsolete client state, which must not inherit the fresh ETag.
+      // Legacy DA preserves client-first restores (e.g. a replaced image FPO).
+      // Fenced Source clients instead replace their Y.Doc on 4412.
       const svBefore = Y.encodeStateVector(ydoc);
 
       const restoreFromBackend = async () => {
@@ -927,7 +1148,7 @@ export const persistence = {
           const svAfter = Y.encodeStateVector(ydoc);
           const clientHasUpdated = svBefore.length !== svAfter.length
             || svBefore.some((v, i) => v !== svAfter[i]);
-          if (clientHasUpdated && !isHelix) {
+          if (clientHasUpdated && !requiresSourceRestore) {
             // eslint-disable-next-line no-console
             console.log('[docroom] Skipping da-admin reload: client state received', docName);
           } else {
@@ -955,9 +1176,13 @@ export const persistence = {
                   aem2doc(current, ydoc);
                 }
               });
-              if (isHelix) {
+              if (requiresSourceRestore) {
                 backendRestored = true;
-                await storeState(docName, Y.encodeStateAsUpdate(ydoc), storage);
+                if (isHelix) {
+                  await storeState(docName, Y.encodeStateAsUpdate(ydoc), storage);
+                } else {
+                  await storeSourceState(ydoc, docName);
+                }
               }
               if (ydoc !== docs.get(docName) || ydoc.discardPendingChanges) {
                 return;
@@ -970,7 +1195,7 @@ export const persistence = {
               if (!isExpectedPlatformEvent(error)) {
                 showError(ydoc, error);
               }
-              if (isHelix) {
+              if (requiresSourceRestore) {
                 restoreError = error;
                 // eslint-disable-next-line no-param-reassign
                 ydoc.lastSaveError = error;
@@ -981,13 +1206,14 @@ export const persistence = {
             }
           }
 
-          // Helix is anchored only after restoring the fetched content.
-          // da-admin also anchors its intentional client-first continuation.
-          await safePutLastsync(storage, current, docName, 'after da-admin fetch');
+          if (!isFencedSource(ydoc, docName)) {
+            // Legacy DA also anchors its intentional client-first continuation.
+            await safePutLastsync(storage, current, docName, 'after da-admin fetch');
+          }
         }
       };
 
-      if (isHelix && freshRoom) {
+      if (fencedSource || (isHelix && freshRoom)) {
         await restoreFromBackend();
       } else {
         restoreAfterDelay = new Promise((resolve) => {
@@ -1003,10 +1229,14 @@ export const persistence = {
 
     ydoc.on('update', async () => {
       // Whenever we receive an update on the document store it in the local storage
-      if (ydoc === docs.get(docName)
-        && !(isHelix && restoreAfterDelay && !backendRestored)) {
+      if (ydoc === docs.get(docName) && !ydoc.discardPendingChanges
+        && !(requiresSourceRestore && restoreAfterDelay && !backendRestored)) {
         try {
-          await storeState(docName, Y.encodeStateAsUpdate(ydoc), storage);
+          if (!isHelix) {
+            await storeSourceState(ydoc, docName);
+          } else {
+            await storeState(docName, Y.encodeStateAsUpdate(ydoc), storage);
+          }
         } catch (err) {
           // eslint-disable-next-line no-console
           console.error('[docroom] Failed to persist state to storage', docName, err);
@@ -1014,42 +1244,36 @@ export const persistence = {
       }
     });
 
-    let saving = false;
     let savingPromise = null;
-    const saveToAdmin = async () => {
-      if (saving) {
-        return;
+    const saveToAdmin = () => {
+      if (savingPromise) {
+        return savingPromise;
       }
-      if (!current || ydoc.discardPendingChanges || ydoc !== docs.get(docName)) {
-        return;
+      if ((!current && !requiresSourceRestore)
+        || ydoc.discardPendingChanges || ydoc !== docs.get(docName)) {
+        return undefined;
       }
-      saving = true;
-      savingPromise = (async () => {
-        try {
-          if (isHelix) {
-            if (restoreAfterDelay) {
-              await restoreAfterDelay;
-            }
-            if (restoreError || ydoc.discardPendingChanges || ydoc !== docs.get(docName)) {
-              return;
-            }
-          }
-          current = await persistence.update(ydoc, current, docName);
-          if (!isHelixDoc(docName, ydoc) || !ydoc.lastSaveError) {
-            // eslint-disable-next-line no-param-reassign
-            ydoc.hasClientChanged = false;
-          }
-        } finally {
-          saving = false;
-          savingPromise = null;
+      savingPromise = Promise.resolve().then(async () => {
+        if (requiresSourceRestore && restoreAfterDelay) {
+          await restoreAfterDelay;
         }
-      })();
-      await savingPromise;
+        if (restoreError || ydoc.discardPendingChanges || ydoc !== docs.get(docName)) {
+          return;
+        }
+        current = await persistence.update(ydoc, current, docName);
+        if (!ydoc.lastSaveError) {
+          // eslint-disable-next-line no-param-reassign
+          ydoc.hasClientChanged = false;
+        }
+      }).finally(() => {
+        savingPromise = null;
+      });
+      return savingPromise;
     };
 
     const debouncedSave = debounce(saveToAdmin, 2000, { maxWait: 10000 });
     ydoc.on('update', (update, origin) => {
-      if (origin !== ERROR_ORIGIN || !isHelixDoc(docName, ydoc)) {
+      if (origin !== ERROR_ORIGIN) {
         debouncedSave(update, origin);
       }
     });
@@ -1060,12 +1284,12 @@ export const persistence = {
       // starting a new one — ensures the ack is not sent before the PUT finishes.
       if (savingPromise) {
         await savingPromise;
-        if (isHelixDoc(docName, ydoc) && ydoc.lastSaveError) {
+        if (ydoc.lastSaveError) {
           throw ydoc.lastSaveError;
         }
       }
       await saveToAdmin();
-      if (isHelixDoc(docName, ydoc) && ydoc.lastSaveError) {
+      if (ydoc.lastSaveError) {
         throw ydoc.lastSaveError;
       }
     };
@@ -1076,7 +1300,7 @@ export const persistence = {
 
     // Periodically (every 5s) verify the document's ETag still matches the one we
     // last saw on get/put, logging the result. Cleared in WSSharedDoc.destroy.
-    // Only Helix-backed documents carry an ETag, so skip scheduling otherwise.
+    // Only Helix uses polling; Source relies on conditional PUT and syncadmin.
     if (!ydoc.etagCheckInterval && isHelixDoc(docName, ydoc)
       && !ydoc.isDestroyed && ydoc === docs.get(docName) && ydoc.conns.size > 0) {
       // eslint-disable-next-line no-param-reassign
@@ -1166,9 +1390,29 @@ export class WSSharedDoc extends Y.Doc {
  * @param {TransactionalStorage} storage - the durable object storage object
  * @param {Map} [timingData] - optional map to receive bindState timing measurements
  * @param {boolean} gc - whether garbage collection is enabled
- * @returns The Yjs document object, which may be shared across multiple sockets.
+ * @param {boolean} waking - Admit a socket restored by the Hibernation API.
+ * @returns The shared document, or undefined if a waking socket must reload.
  */
-export const getYDoc = async (docname, conn, env, storage, timingData, ctx, gc = true) => {
+export const getYDoc = async (
+  docname,
+  conn,
+  env,
+  storage,
+  timingData,
+  ctx,
+  gc = true,
+  waking = false,
+) => {
+  while (discardingRooms.has(docname)) {
+    // eslint-disable-next-line no-await-in-loop
+    await discardingRooms.get(docname);
+  }
+  if (retiredConnections.has(conn)) {
+    if (waking) {
+      return undefined;
+    }
+    throw new Error('Connection invalidated; reconnect to reload the document');
+  }
   let doc = docs.get(docname);
   if (doc === undefined) {
     // The doc is not yet in the cache, create a new one.
@@ -1178,7 +1422,21 @@ export const getYDoc = async (docname, conn, env, storage, timingData, ctx, gc =
     docs.set(docname, doc);
   }
 
-  if (!doc.conns.get(conn)) {
+  const attachment = waking ? conn.deserializeAttachment?.() : undefined;
+  const awaitingAdmission = waking && !doc.conns.has(conn)
+    && !freshHibernationConnections.has(conn)
+    && (!isHelixDoc(docname, env) || !!attachment?.sourceSession);
+  const requiresContinuity = () => isFencedSource(doc) || !!attachment?.sourceSession;
+  const rejectWake = () => {
+    if (!retiredConnections.has(conn)) {
+      retiredConnections.add(conn);
+      closeConn(doc, conn, true, RELOAD_CLOSE);
+    }
+    return undefined;
+  };
+
+  // Do not register an unchecked socket: restoring Yjs can broadcast updates.
+  if (!awaitingAdmission && !doc.conns.has(conn)) {
     doc.conns.set(conn, new Set());
   }
 
@@ -1202,6 +1460,9 @@ export const getYDoc = async (docname, conn, env, storage, timingData, ctx, gc =
   // already be resolved.
   try {
     const timings = await doc.promise;
+    if (doc.discardPendingChanges) {
+      throw new Error('Room invalidated while loading; reload the document');
+    }
     if (timingData) {
       timings.forEach((v, k) => timingData.set(k, v));
     }
@@ -1210,9 +1471,23 @@ export const getYDoc = async (docname, conn, env, storage, timingData, ctx, gc =
     // (triggered by destroy) from calling send() → closeConn() on this conn.
     doc.conns.delete(conn);
     // ensure to cleanup event handlers and timers
-    doc.destroy();
-    docs.delete(docname);
+    removeRoom(doc);
+    if (awaitingAdmission && requiresContinuity()) {
+      return rejectWake();
+    }
     throw e;
+  }
+  if (awaitingAdmission) {
+    if (retiredConnections.has(conn) || doc.isDestroyed || docs.get(docname) !== doc) {
+      return undefined;
+    }
+    if (requiresContinuity() && (!doc.sourceSession || doc.etagUnverified
+      || attachment?.sourceSession !== doc.sourceSession)) {
+      return rejectWake();
+    }
+    if (!doc.conns.has(conn)) {
+      doc.conns.set(conn, new Set());
+    }
   }
   return doc;
 };
@@ -1249,6 +1524,9 @@ export const messageListener = async (conn, doc, message) => {
     const encoder = encoding.createEncoder();
     const decoder = decoding.createDecoder(message);
     messageType = decoding.readVarUint(decoder);
+    if (doc.discardPendingChanges && messageType !== messageFlushRequest) {
+      return;
+    }
     switch (messageType) {
       case messageSync: {
         encoding.writeVarUint(encoder, messageSync);
@@ -1273,19 +1551,30 @@ export const messageListener = async (conn, doc, message) => {
         break;
       }
       case messageFlushRequest: {
-        const ackEncoder = encoding.createEncoder();
-        encoding.writeVarUint(ackEncoder, messageFlushResponse);
+        const replies = pendingFlushReplies.get(doc) ?? new Set();
+        pendingFlushReplies.set(doc, replies);
+        const reply = (error) => {
+          if (!replies.delete(reply)) {
+            return;
+          }
+          const ackEncoder = encoding.createEncoder();
+          encoding.writeVarUint(ackEncoder, messageFlushResponse);
+          encoding.writeVarUint(ackEncoder, error ? 0 : 1);
+          if (error) {
+            encoding.writeVarString(ackEncoder, error.message || 'flush failed');
+          }
+          send(doc, conn, encoding.toUint8Array(ackEncoder));
+        };
+        replies.add(reply);
         try {
           if (doc.flushSave) {
             await doc.flushSave();
           }
-          encoding.writeVarUint(ackEncoder, 1); // ok
+          reply();
         } catch (flushErr) {
           logError(flushErr, '[docroom] flushSave failed', flushErr);
-          encoding.writeVarUint(ackEncoder, 0); // not ok
-          encoding.writeVarString(ackEncoder, flushErr.message || 'flush failed');
+          reply(flushErr);
         }
-        send(doc, conn, encoding.toUint8Array(ackEncoder));
         break;
       }
       default:
@@ -1298,6 +1587,26 @@ export const messageListener = async (conn, doc, message) => {
     }
   }
 };
+
+function sendInitialState(doc, conn) {
+  try {
+    // send sync step 1
+    let encoder = encoding.createEncoder();
+    encoding.writeVarUint(encoder, messageSync);
+    syncProtocol.writeSyncStep1(encoder, doc);
+    send(doc, conn, encoding.toUint8Array(encoder));
+    const awarenessStates = doc.awareness.getStates();
+    if (awarenessStates.size > 0) {
+      encoder = encoding.createEncoder();
+      encoding.writeVarUint(encoder, messageAwareness);
+      encoding.writeVarUint8Array(encoder, awarenessProtocol
+        .encodeAwarenessUpdate(doc.awareness, Array.from(awarenessStates.keys())));
+      send(doc, conn, encoding.toUint8Array(encoder));
+    }
+  } catch (err) {
+    logError(err, '[docroom] Error while setting up WSConnection', doc.name, err);
+  }
+}
 
 /**
  * Called when a new (Yjs) WebSocket connection is being established.
@@ -1317,7 +1626,10 @@ export const setupWSConnection = async (conn, docName, env, storage, ctx, hibern
   // eslint-disable-next-line no-param-reassign
   conn.connectedAt = Date.now();
 
-  if (!hibernation) {
+  if (hibernation) {
+    // This entry point comes from edge.initSession, not a waking message.
+    freshHibernationConnections.add(conn);
+  } else {
     // Register close listener BEFORE any async operation so cleanup always fires,
     // even if the client disconnects while the document is still loading.
     conn.addEventListener('close', () => {
@@ -1329,33 +1641,23 @@ export const setupWSConnection = async (conn, docName, env, storage, ctx, hibern
   }
 
   // get doc, initialize if it does not exist yet
-  const doc = await getYDoc(docName, conn, env, storage, timingData, ctx, true);
+  const doc = await getYDoc(docName, conn, env, storage, timingData, ctx, true).finally(() => {
+    freshHibernationConnections.delete(conn);
+  });
 
-  if (!hibernation) {
+  if (hibernation) {
+    if (doc.sourceSession && !retiredConnections.has(conn)) {
+      const attachment = conn.deserializeAttachment?.();
+      if (attachment) {
+        conn.serializeAttachment({ ...attachment, sourceSession: doc.sourceSession });
+      }
+    }
+  } else {
     // listen and reply to events
     conn.addEventListener('message', (message) => messageListener(conn, doc, new Uint8Array(message.data)));
   }
 
-  // put the following in a variables in a block so the interval handlers don't keep in in
-  // scope
-  try {
-    // send sync step 1
-    let encoder = encoding.createEncoder();
-    encoding.writeVarUint(encoder, messageSync);
-    syncProtocol.writeSyncStep1(encoder, doc);
-    send(doc, conn, encoding.toUint8Array(encoder));
-    const awarenessStates = doc.awareness.getStates();
-    if (awarenessStates.size > 0) {
-      encoder = encoding.createEncoder();
-      encoding.writeVarUint(encoder, messageAwareness);
-      encoding.writeVarUint8Array(encoder, awarenessProtocol
-        .encodeAwarenessUpdate(doc.awareness, Array.from(awarenessStates.keys())));
-      send(doc, conn, encoding.toUint8Array(encoder));
-    }
-  } catch (err) {
-    logError(err, '[docroom] Error while setting up WSConnection', docName, err);
-  }
-
+  sendInitialState(doc, conn);
   return timingData;
 };
 
@@ -1369,23 +1671,25 @@ export const setupWSConnection = async (conn, docName, env, storage, ctx, hibern
  * @param {ArrayBuffer|string} message - The raw message from the WebSocket
  */
 export const handleWebSocketMessage = async (conn, docName, env, storage, message, ctx) => {
-  let doc = docs.get(docName);
-  if (!doc) {
-    // DO was hibernated; re-establish Yjs state without re-registering event listeners
-    await setupWSConnection(conn, docName, env, storage, ctx, true);
-    doc = docs.get(docName);
-  } else if (!doc.conns.has(conn)) {
-    // The doc was already cached (another connection got there first), so the setup
-    // path above was skipped. Register conn defensively — without this, a client that
-    // wins the race against ctx.waitUntil(initSession(...)) can have its awareness
-    // update processed before initSession's own doc.conns registration runs, leaving
-    // its clientID attributed to no conn and leaking it forever on close.
-    doc.conns.set(conn, new Set());
+  if (retiredConnections.has(conn)) {
+    return;
   }
-  if (doc?.promise) {
+  const cached = docs.get(docName);
+  // Check every unregistered socket, even when a different socket already rehydrated the room.
+  const doc = cached?.conns.has(conn) ? cached
+    : await getYDoc(docName, conn, env, storage, undefined, ctx, true, true);
+  if (cached === doc && doc?.promise) {
     await doc.promise;
   }
-  if (doc && doc === docs.get(docName) && !doc.isDestroyed) {
+  if (doc && doc === docs.get(docName) && !doc.isDestroyed && !retiredConnections.has(conn)) {
+    if (!cached) {
+      // The room was hibernating. Send sync only after admitting the socket.
+      // eslint-disable-next-line no-param-reassign
+      conn.binaryType = 'arraybuffer';
+      // eslint-disable-next-line no-param-reassign
+      conn.connectedAt = Date.now();
+      sendInitialState(doc, conn);
+    }
     await messageListener(conn, doc, new Uint8Array(message));
   }
 };

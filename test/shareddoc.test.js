@@ -163,8 +163,8 @@ describe('Collab Test Suite', () => {
     const ydoc = { daadmin };
     const result = await persistence.get('foo', undefined, ydoc);
     assert.equal(result, 'content');
-    assert.equal(ydoc.etag, undefined, 'da-admin GET must not track ETags');
-    assert.equal(ydoc.etagUnverified, undefined);
+    assert.strictEqual(ydoc.etag, 'W/"abc"', 'Source GET must retain the exact ETag');
+    assert.strictEqual(ydoc.etagUnverified, false);
   });
 
   it('Test persistence get auth', async () => {
@@ -297,7 +297,9 @@ describe('Collab Test Suite', () => {
     };
     const conns = new Map();
     // conns.set({}, new Set());
-    const result = await persistence.put({ name: 'foo', conns, daadmin }, 'test');
+    const result = await persistence.put({
+      name: 'foo', conns, daadmin, etag: null,
+    }, 'test');
     assert(result.ok);
     assert.equal(result.status, 200);
     assert.equal(result.statusText, 'OK - Stored');
@@ -318,7 +320,9 @@ describe('Collab Test Suite', () => {
     };
     const conns = new Map();
     conns.set({ auth: 'myauth' }, new Set());
-    const result = await persistence.put({ name: 'foo', conns, daadmin }, 'test');
+    const result = await persistence.put({
+      name: 'foo', conns, daadmin, etag: null,
+    }, 'test');
     assert(result.ok);
     assert.equal(result.status, 200);
     assert.equal(result.statusText, 'OK - Stored too');
@@ -335,7 +339,9 @@ describe('Collab Test Suite', () => {
         ok: true, status: 200, statusText: 'OK', headers: new Headers(),
       };
     };
-    const result = await persistence.put({ name: 'foo', conns: new Map(), daadmin }, 'test');
+    const result = await persistence.put({
+      name: 'foo', conns: new Map(), daadmin, etag: null,
+    }, 'test');
     assert(result.ok);
   });
 
@@ -356,6 +362,7 @@ describe('Collab Test Suite', () => {
       name: 'foo',
       conns: new Map().set({ auth: 'auth', authActions: ['read', 'write'] }, new Set()),
       daadmin,
+      etag: null,
     }, 'test');
     assert(result.ok);
     assert.equal(result.status, 200);
@@ -554,22 +561,27 @@ describe('Collab Test Suite', () => {
 
     pss.persistence.get = async () => '<main><div><p>initial</p></div></main>';
 
-    let putResolved = false;
     pss.persistence.put = async () => ({ ok: false, status: 401, statusText: 'Unauthorized' });
 
-    const conn = { auth: undefined, close() {} };
+    let closed = false;
+    const conn = {
+      auth: undefined,
+      readyState: 1,
+      send() {},
+      close() { closed = true; },
+    };
+    ydoc.conns.set(conn, new Set());
     await pss.persistence.bindState(docName, ydoc, conn, storage);
     ydoc.hasClientChanged = true;
 
-    // This must resolve — no deadlock — even though closeConn is called
+    // This must reject without deadlocking, even though closeConn is called
     // from within persistence.update while the save is in-flight.
     const result = await Promise.race([
-      ydoc.flushSave().then(() => 'resolved'),
+      assert.rejects(ydoc.flushSave(), /401 - Unauthorized/).then(() => 'rejected'),
       new Promise((r) => { setTimeout(r, 500, 'timeout'); }),
     ]);
-    putResolved = true;
-    assert.equal(result, 'resolved', 'flushSave must resolve; deadlock detected if timeout fires');
-    assert(putResolved);
+    assert.equal(result, 'rejected', 'flushSave must reject; deadlock detected if timeout fires');
+    assert(closed);
   });
 
   it('Test persistence update skips PUT when content is empty stub and no client edit', async () => {
@@ -669,6 +681,7 @@ describe('Collab Test Suite', () => {
   it('Test persistence update closes all and cleans storage on 412', async () => {
     const docName = 'https://admin.da.live/source/foo.html';
     const ydoc = new WSSharedDoc(docName);
+    ydoc.etag = null;
 
     const storageDeleteAllCalled = [];
     ydoc.storage = {
@@ -676,8 +689,12 @@ describe('Collab Test Suite', () => {
     };
 
     const closeCalled = [];
-    const conn1 = { close: () => closeCalled.push('close1'), readOnly: false };
-    const conn2 = { close: () => closeCalled.push('close2'), readOnly: false };
+    const conn1 = {
+      close: () => closeCalled.push('close1'), readOnly: false, readyState: 1, send() {},
+    };
+    const conn2 = {
+      close: () => closeCalled.push('close2'), readOnly: false, readyState: 1, send() {},
+    };
     ydoc.conns.set(conn1, new Set(['client1']));
     ydoc.conns.set(conn2, new Set(['client2']));
 
@@ -714,11 +731,14 @@ describe('Collab Test Suite', () => {
 
     // First connection and 412 scenario
     const ydoc = new WSSharedDoc(docName);
+    ydoc.etag = null;
     ydoc.storage = {
       deleteAll: async () => {},
     };
 
-    const conn1 = { close: () => {}, readOnly: false };
+    const conn1 = {
+      close() {}, readOnly: false, readyState: 1, send() {},
+    };
     ydoc.conns.set(conn1, new Set(['client1']));
 
     const docs = setYDoc(docName, ydoc);
@@ -746,9 +766,12 @@ describe('Collab Test Suite', () => {
   it('Test ydoc error map is set on 412', async () => {
     const docName = 'https://admin.da.live/source/baz.html';
     const ydoc = new WSSharedDoc(docName);
+    ydoc.etag = null;
     ydoc.storage = { deleteAll: async () => {} };
 
-    const conn1 = { close: () => {}, readOnly: false };
+    const conn1 = {
+      close() {}, readOnly: false, readyState: 1, send() {},
+    };
     ydoc.conns.set(conn1, new Set());
     setYDoc(docName, ydoc);
 
@@ -787,8 +810,11 @@ describe('Collab Test Suite', () => {
     const docName = 'https://admin.da.live/source/qux.html';
     const ydoc = new pss.WSSharedDoc(docName);
     ydoc.storage = { deleteAll: async () => {} };
+    ydoc.etag = null;
 
-    const conn1 = { close: () => {}, readOnly: false };
+    const conn1 = {
+      close() {}, readOnly: false, readyState: 1, send() {},
+    };
     ydoc.conns.set(conn1, new Set());
 
     const docs = pss.setYDoc(docName, ydoc);
@@ -824,14 +850,8 @@ describe('Collab Test Suite', () => {
     // Modify document
     aem2doc('<main><div><p>modified</p></div></main>', ydoc);
 
-    // Trigger 412 which closes all connections and removes from global map
-    await pss.persistence.update(ydoc, '<main><div><p>initial</p></div></main>', 'test.html');
-
-    // Flush pending microtasks: the flushSave path inside closeConn (triggered by the
-    // aem2doc update event above) is async and may still be completing.
-    await new Promise((r) => {
-      setTimeout(r, 0);
-    });
+    // Wait for the debounced save and verify that the 412 actually invalidates the room.
+    await assert.rejects(ydoc.flushSave(), /412/);
 
     assert(!docs.has(docName), 'Doc should be removed from global map');
 
@@ -1548,7 +1568,10 @@ describe('Collab Test Suite', () => {
       list: async () => {
         throw new Error('yikes');
       },
-      get: async () => {
+      get: async (key) => {
+        if (key === 'fencedSourceEtag') {
+          return undefined;
+        }
         throw new Error('yikes');
       },
     };
@@ -1797,6 +1820,7 @@ describe('Collab Test Suite', () => {
     // awareness entry forever.
     const docName = 'http://www.acme.org/racedoc.html';
     const ydoc = new WSSharedDoc(docName);
+    ydoc.promise = Promise.resolve(new Map());
     setYDoc(docName, ydoc);
 
     // Simulate an already-connected peer (the other open tab).
@@ -3427,7 +3451,7 @@ describe('Collab Test Suite', () => {
       fetch: async (url, opts) => {
         calls.push({ url, opts });
         return {
-          ok: true, status: 200, statusText: 'OK', headers: new Headers({ etag: '"unused"' }),
+          ok: true, status: 200, statusText: 'OK', headers: new Headers({ etag: '"saved"' }),
         };
       },
     };
@@ -3437,7 +3461,9 @@ describe('Collab Test Suite', () => {
       [{ auth: 'auth-a' }, new Set()],
       [{ auth: 'read-only', readOnly: true }, new Set()],
     ]);
-    const ydoc = { name: 'https://admin.da.live/source/x.html', conns, daadmin };
+    const ydoc = {
+      name: 'https://admin.da.live/source/x.html', conns, daadmin, etag: '"initial"',
+    };
     const body = 'plain html content larger than empty stub padding padding padding padding padding padding';
     await persistence.put(ydoc, body);
 
@@ -3456,8 +3482,8 @@ describe('Collab Test Suite', () => {
     assert.equal(calls[0].opts.method, 'PUT');
     assert.equal(calls[0].opts.headers.get('Authorization'), 'auth-a,auth-b');
     assert.equal(calls[0].opts.headers.get('If-Match'), '*');
-    assert.equal(ydoc.etag, undefined, 'da-admin PUT must not track ETags');
-    assert.equal(ydoc.etagUnverified, undefined);
+    assert.equal(ydoc.etag, '"initial"', 'Legacy PUT ETag does not opt in to fencing');
+    assert.strictEqual(ydoc.etagUnverified, undefined);
     assert.equal(ydoc.saveGeneration, undefined);
     assert.equal(ydoc.pendingPuts, undefined);
   });
