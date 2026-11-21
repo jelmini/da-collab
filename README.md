@@ -70,6 +70,39 @@ logs the missing validator and pauses further protected saves until reload. da-a
 its existing multipart PUT and `If-Match: *` behavior. Complete lost-update protection additionally
 requires the API to enforce the precondition atomically at the storage write.
 
+### Local da-rs Helix 6 Source (PoC)
+
+Opt in only in an isolated local Worker configuration. Set `DA_RS_ORIGIN` to the
+exact Source origin (for example `http://localhost:38080`, no trailing slash), and
+add a service binding named `dars` to the local da-rs Source bridge. Its upstream
+must serve that origin without redirects. Keep `daadmin` configured independently
+for ordinary and qualified-branch rooms. `IS_HELIX` is not the da-rs binding.
+Leave `DA_RS_ORIGIN` unset to disable the binding. A malformed value or a hosted
+DA Admin or `api.aem.live` origin is a configuration error; room requests and
+notifications fail closed until it is corrected, rather than falling back.
+
+The Worker authorizes HEAD on the requested DA or Helix 6 alias and routes both
+to the canonical `<origin>/source/{org}/{site}/{path}`. Org and site names follow
+da-rs scope rules; the H6 alias must already use lowercase, unescaped scopes.
+Default-room document paths fold ASCII case. Unicode document names must already
+be lowercase: Java and JavaScript differ on contextual case conversion, so this
+PoC rejects non-ASCII case variants rather than splitting a room.
+`X-DA-Source-Mode: helix6` selects Helix 6;
+`X-DA-Source-Unavailable: true` rejects the room. No mode hint on an authorized DA
+response means legacy; no mode hint on an authorized Helix 6 response is an error.
+Helix 6 uses bound raw GET and PUT, the literal strong ETag in `If-Match`, and
+`X-DA-Initiator: collab`. A 412 discards the snapshot and closes with 4412.
+
+Set `COLLAB_SHARED_SECRET` to match `da-rs.collab.shared-secret`, and
+`DA_RS_ORIGIN` to the same origin as `da-rs.admin.public-origin` so the URL in
+`doc` resolves to the same room. For a committed marked-site Source mutation,
+da-rs sends `POST /api/v1/syncadmin` or `POST /api/v1/deleteadmin` with the canonical
+DA URL in `doc` and `Authorization: token <shared-secret>`. Legacy GET notifications
+still work. The receiver accepts either bound alias and never HEADs a notification
+target. The sender suppresses notifications for collab-initiated writes.
+
+### Public Helix polling
+
 Helix polling retries the distinct tokens of other active collaborators after a 401/403.
 Connections using rejected tokens close with 4401/4403 so the editor can refresh authentication;
 stored pending edits are preserved and no save is attempted with rejected credentials.

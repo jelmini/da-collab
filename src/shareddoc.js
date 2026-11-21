@@ -18,6 +18,9 @@ import {
   aem2doc, doc2aem, json2doc, doc2json,
 } from '@adobe/da-parser';
 import debounce from './debounce.js';
+import {
+  HELIX6, fetchBoundSource, hasStrongEtag, readBoundSourceMode, resolveBoundSource, sourceError,
+} from './bound-source.js';
 
 const wsReadyStateConnecting = 0;
 const wsReadyStateOpen = 1;
@@ -85,8 +88,18 @@ function getLocalTestBackendOverride(env) {
  * @param {string} docName - the document URL
  * @param {object} [env] - the worker environment (may carry `IS_HELIX`)
  */
-export const isHelixDoc = (docName, env) => getLocalTestBackendOverride(env)?.isHelix
-  ?? docName.startsWith('https://api.aem.live/');
+export const isHelixDoc = (docName, env) => !env?.boundMode
+  && (getLocalTestBackendOverride(env)?.isHelix ?? docName.startsWith('https://api.aem.live/'));
+
+function boundBackend(env) {
+  return (url, opts) => {
+    const target = resolveBoundSource(url, env);
+    if (!target || target.canonical !== url) {
+      throw sourceError(503, 'Invalid bound Source room');
+    }
+    return fetchBoundSource(env, env.boundMode === HELIX6 ? target.helix : target.canonical, opts);
+  };
+}
 
 /**
  * Resolve the content backend for a document.
@@ -109,14 +122,15 @@ export function getBackend(docName, env) {
 
   return {
     // A fetch that already knows where to go.
-    fetch: (url, opts) => (isHelix ? globalThis : env.daadmin)
-      .fetch(localTestOverride?.rewriteUrl(url) ?? url, opts),
+    fetch: env?.boundMode ? boundBackend(env)
+      : (url, opts) => (isHelix ? globalThis : env.daadmin)
+        .fetch(localTestOverride?.rewriteUrl(url) ?? url, opts),
 
     // Build the body (and any body-specific headers) for a content PUT.
     // Helix takes the raw content with an explicit Content-Type; da-admin takes
     // multipart form-data with a `data` part (its boundary header is implicit).
     putReqData: (content, mimeType) => {
-      if (isHelix) {
+      if (isHelix || env?.boundMode === HELIX6) {
         return { body: content, size: content.length, headers: { 'Content-Type': mimeType } };
       }
       const blob = new Blob([content], { type: mimeType });
@@ -152,6 +166,7 @@ const sourceStorageTails = new WeakMap();
 const sourcePurgeRetries = new WeakSet();
 const discardingRooms = new Map();
 const retiredConnections = new WeakSet();
+const boundLastCloses = new WeakMap();
 const freshHibernationConnections = new WeakSet();
 const pendingFlushReplies = new WeakMap();
 
@@ -162,6 +177,7 @@ export const messageFlushResponse = 3;
 const ERROR_ORIGIN = Symbol('error-notification');
 const FENCED_SOURCE_ETAG = 'fencedSourceEtag';
 const FENCED_SOURCE_SESSION = 'fencedSourceSession';
+const FENCED_SOURCE_MODE = 'fencedSourceMode';
 const RELOAD_CLOSE = { code: 4412, reason: 'reload required' };
 const MAX_STORAGE_KEYS = 128;
 const MAX_STORAGE_VALUE_SIZE = 131072;
@@ -212,9 +228,11 @@ function isBranchSource(docName) {
 }
 
 const isFencedSource = (ydoc, docName = ydoc.name ?? '') => !isHelixDoc(docName, ydoc)
-  && (ydoc.sourceFenced || isBranchSource(docName));
+  && (ydoc.boundMode === HELIX6 || ydoc.sourceFenced || isBranchSource(docName));
 
 const hasSourceValidator = (etag) => typeof etag === 'string' && etag !== '' && etag !== '*';
+const hasRoomValidator = (ydoc, etag) => (ydoc.boundMode === HELIX6
+  ? hasStrongEtag(etag) : hasSourceValidator(etag));
 
 function removeRoom(doc) {
   if (docs.get(doc.name) === doc) {
@@ -249,18 +267,27 @@ export const closeConn = async (doc, conn, skipSave = false, closeOptions = unde
       }
 
       if (doc.conns.size === 0) {
+        // Keep the departing grant private to this room's final flush. It is not
+        // a connected peer, and cannot authorize a save after a new peer joins.
+        const lastClose = doc.boundMode === HELIX6
+          ? { id: Symbol('final flush'), auth: conn.readOnly === true ? undefined : conn.auth }
+          : undefined;
+        if (lastClose) {
+          boundLastCloses.set(doc, lastClose.id);
+        }
         // External changes must discard pending edits. Re-entrant closes from
         // persistence.update must also skip flushing to avoid awaiting their own save.
         if (doc.flushSave && !skipSave && !doc.discardPendingChanges) {
           // eslint-disable-next-line no-console
           console.log('[docroom] Flushing pending save on last connection close', doc.name);
           try {
-            await doc.flushSave();
+            await doc.flushSave(lastClose);
           } catch (err) {
             logError(err, '[docroom] Failed to flush on last connection close', doc.name, err);
           }
         }
-        if (doc.conns.size === 0) {
+        if (doc.conns.size === 0 && (!lastClose || boundLastCloses.get(doc) === lastClose.id)) {
+          boundLastCloses.delete(doc);
           const duration = conn.connectedAt ? Date.now() - conn.connectedAt : 0;
           // eslint-disable-next-line no-console
           console.log('[docroom] Last connection closed', doc.name, `duration: ${duration}ms`, `unsaved: ${!!doc.hasClientChanged}`);
@@ -372,6 +399,7 @@ export const readState = async (docName, storage, clearOnMismatch = true) => {
  * @param {number} chunkSize - The chunk size
  * @param {string|null} [sourceEtag] - Exact Source validator for this snapshot (null = unverified).
  * @param {string} [sourceSession] - Socket continuity identity for a fenced snapshot.
+ * @param {string} [sourceMode] - Bound transport used to create a fenced snapshot.
  */
 export const storeState = async (
   docName,
@@ -380,6 +408,7 @@ export const storeState = async (
   chunkSize = MAX_STORAGE_VALUE_SIZE,
   sourceEtag = undefined,
   sourceSession = undefined,
+  sourceMode = undefined,
 ) => {
   const oldChunkCount = await storage.get('chunks');
 
@@ -399,7 +428,7 @@ export const storeState = async (
 
     // Keep the validator and session identity atomic with the snapshot.
     const maxChunks = MAX_STORAGE_KEYS - (sourceEtag === undefined ? 1 : 3)
-      - Number(sourceSession !== undefined);
+      - Number(sourceSession !== undefined) - Number(sourceMode !== undefined);
     if (j > maxChunks) {
       // eslint-disable-next-line no-console
       console.error('[docroom] Object too big for worker storage', docName, j, MAX_STORAGE_KEYS);
@@ -419,6 +448,9 @@ export const storeState = async (
   }
   if (sourceSession !== undefined) {
     serialized[FENCED_SOURCE_SESSION] = sourceSession;
+  }
+  if (sourceMode !== undefined) {
+    serialized[FENCED_SOURCE_MODE] = sourceMode;
   }
 
   await storage.put(serialized);
@@ -446,7 +478,15 @@ function storeSourceState(ydoc, docName = ydoc.name) {
         sourceEtag = ydoc.etag;
       }
       const state = Y.encodeStateAsUpdate(ydoc);
-      return storeState(docName, state, ydoc.storage, undefined, sourceEtag, ydoc.sourceSession);
+      return storeState(
+        docName,
+        state,
+        ydoc.storage,
+        undefined,
+        sourceEtag,
+        ydoc.sourceSession,
+        sourceEtag === undefined ? undefined : ydoc.boundMode,
+      );
     }
     return undefined;
   });
@@ -460,7 +500,9 @@ function purgeSourceState(ydoc) {
     sourcePurgeRetries.add(storage);
     await storage.put(FENCED_SOURCE_ETAG, null);
     const chunks = await storage.get('chunks');
-    await storage.delete(['doc', 'docstore', 'chunks', 'lastsync', FENCED_SOURCE_SESSION]);
+    await storage.delete([
+      'doc', 'docstore', 'chunks', 'lastsync', FENCED_SOURCE_SESSION, FENCED_SOURCE_MODE,
+    ]);
     if (chunks) {
       await storage.delete(Array.from({ length: chunks }, (_, i) => `chunk_${i}`));
     }
@@ -508,6 +550,7 @@ function discardRoom(ydoc, error) {
   // The promise covers storage and socket close, never the active Source save.
   // eslint-disable-next-line no-param-reassign
   ydoc.discardPendingChanges = true;
+  boundLastCloses.delete(ydoc);
   ydoc.cancelSave?.();
   if (fencedSource) {
     // eslint-disable-next-line no-param-reassign
@@ -575,6 +618,43 @@ export const invalidateFromAdmin = async (docName, discardPendingChanges = false
   }
   return false;
 };
+
+/** Admin notices can arrive while the object is asleep and no Y.Doc is cached. */
+export async function invalidateBoundFromAdmin(docName, ctx) {
+  const doc = docs.get(docName);
+  let retired = false;
+  for (const conn of ctx?.getWebSockets?.() ?? []) {
+    const attachment = conn.deserializeAttachment();
+    if (attachment?.docName === docName
+      && (attachment.boundMode === HELIX6 || attachment.sourceSession)
+      && !retiredConnections.has(conn) && !doc?.conns.has(conn)) {
+      retiredConnections.add(conn);
+      retired = true;
+      try {
+        conn.close(RELOAD_CLOSE.code, RELOAD_CLOSE.reason);
+      } catch { /* already closed */ }
+    }
+  }
+  const { storage } = ctx ?? {};
+  if (doc || !storage) {
+    return (await invalidateFromAdmin(docName)) || retired;
+  }
+  const discarding = discardingRooms.get(docName);
+  if (discarding) {
+    await discarding;
+    return true;
+  }
+  const cleanup = Promise.resolve().then(async () => {
+    await sourceStorageTails.get(storage);
+    if (retired || (await storage.get(FENCED_SOURCE_ETAG)) !== undefined) {
+      await purgeSourceState({ name: docName, storage });
+      return true;
+    }
+    return false;
+  }).finally(() => discardingRooms.delete(docName));
+  discardingRooms.set(docName, cleanup);
+  return cleanup;
+}
 
 const normalizeEtag = (etag) => (etag ? etag.replace(/^W\//, '') : null);
 
@@ -645,7 +725,7 @@ export const persistence = {
    */
   get: async (docName, auth, ydoc) => {
     const docType = getDocType(docName);
-    const initalOpts = {};
+    const initalOpts = ydoc.boundMode ? { method: 'GET' } : {};
     if (auth) {
       initalOpts.headers = new Headers({ Authorization: auth });
     }
@@ -654,6 +734,20 @@ export const persistence = {
     const isHelix = isHelixDoc(docName, ydoc);
     let initialReq = await backend.fetch(docName, initalOpts);
     let etag;
+    if (ydoc.boundMode && initialReq.ok) {
+      try {
+        const mode = readBoundSourceMode(initialReq.headers, ydoc.boundMode === HELIX6);
+        if (mode !== ydoc.boundMode) {
+          throw sourceError(412, 'Bound Source mode changed; reload the document');
+        }
+        if (mode === HELIX6 && !hasStrongEtag(initialReq.headers.get('etag'))) {
+          throw sourceError(503, 'Bound Source GET did not return a strong ETag');
+        }
+      } catch (error) {
+        initialReq.body?.cancel();
+        throw error;
+      }
+    }
     if (isHelix && initialReq.ok) {
       const baseline = await getHelixEtagBaseline(backend, docName, initalOpts, initialReq);
       ({ response: initialReq, etag } = baseline);
@@ -670,13 +764,15 @@ export const persistence = {
         // eslint-disable-next-line no-param-reassign
         ydoc.sourceFenced = isFencedSource(ydoc, docName) || initialReq.headers.has('Content-Branch');
         // eslint-disable-next-line no-param-reassign
-        ydoc.etagUnverified = ydoc.sourceFenced && !hasSourceValidator(sourceEtag);
+        ydoc.etagUnverified = ydoc.sourceFenced && !hasRoomValidator(ydoc, sourceEtag);
         // eslint-disable-next-line no-param-reassign
         ydoc.etag = sourceEtag;
       }
       return docType === 'json' ? initialReq.json() : initialReq.text();
     } else {
-      const msg = `[docroom] Unable to get resource from da-admin: ${initialReq.status} - ${initialReq.statusText}`;
+      const msg = ydoc.boundMode
+        ? `[docroom] Unable to get resource from bound Source: ${initialReq.status}`
+        : `[docroom] Unable to get resource from da-admin: ${initialReq.status} - ${initialReq.statusText}`;
       // 401/403 are auth/ACL outcomes the worker cannot bypass — operational
       // noise, not service errors. Mirror persistence.update's PUT demotion so
       // the error stream stays a real-signal channel (see #135).
@@ -701,9 +797,10 @@ export const persistence = {
    * @param {WSSharedDoc} ydoc - The Yjs document, which among other things contains the service
    * binding to da-admin.
    * @param {string} content - The content to store
+   * @param {string} [closingAuth] - Verified grant for a bound H6 final flush only.
    * @returns {Promise<object>} The response from the backend.
    */
-  put: async (ydoc, content) => {
+  put: async (ydoc, content, closingAuth) => {
     const backend = getBackend(ydoc.name, ydoc);
     const isHelix = isHelixDoc(ydoc.name, ydoc);
     const mimeType = getDocType(ydoc.name) === 'json' ? 'application/json' : 'text/html';
@@ -721,7 +818,7 @@ export const persistence = {
 
     const storedEtag = isHelix ? normalizeEtag(ydoc.etag) : ydoc.etag;
     const legacy = !isHelix && !isFencedSource(ydoc);
-    if (!legacy && (!storedEtag || storedEtag === '*' || ydoc.etagUnverified)) {
+    if (!legacy && (!hasRoomValidator(ydoc, storedEtag) || ydoc.etagUnverified)) {
       throw new Error(`Cannot save ${isHelix ? 'Helix' : 'Source'} document without a verified ETag; reload the document`);
     }
     const headers = {
@@ -733,6 +830,13 @@ export const persistence = {
     const auth = keys
       .filter((con) => con.readOnly !== true)
       .map((con) => con.auth);
+
+    if (ydoc.boundMode === HELIX6 && keys.length === 0) {
+      if (!closingAuth) {
+        throw new Error('Cannot save bound Source without an authorized writer');
+      }
+      auth.push(closingAuth);
+    }
 
     if (auth.length > 0) {
       if (isHelix) {
@@ -775,13 +879,13 @@ export const persistence = {
     const stillCurrent = !ydoc.discardPendingChanges && (!cached || docs.get(ydoc.name) === ydoc);
     if (ok && stillCurrent && !legacy) {
       const etag = respHeaders.get('etag');
-      if (isHelix || hasSourceValidator(etag)) {
+      if (isHelix || hasRoomValidator(ydoc, etag)) {
         // eslint-disable-next-line no-param-reassign
         ydoc.etag = isHelix ? normalizeEtag(etag) : etag;
       }
       // A missing validator after a protected write is not evidence of a legacy backend.
       // eslint-disable-next-line no-param-reassign
-      ydoc.etagUnverified = !hasSourceValidator(etag);
+      ydoc.etagUnverified = !hasRoomValidator(ydoc, etag);
       if (ydoc.etagUnverified) {
         // eslint-disable-next-line no-console
         console.warn(`[docroom] ${isHelix ? 'Helix' : 'Source'} save response missing ETag; protected saves require a reload`, ydoc.name);
@@ -796,7 +900,7 @@ export const persistence = {
     return {
       ok,
       status,
-      statusText,
+      statusText: ydoc.boundMode ? '' : statusText,
     };
   },
 
@@ -907,9 +1011,10 @@ export const persistence = {
    * @param {string} current - the current content of the document previously
    * obtained from da-admin
    * @param {string} docName - the name of the document
+   * @param {string} [closingAuth] - Verified grant for a bound H6 final flush only.
    * @returns {Promise<string>} - the new content of the document in da-admin.
    */
-  update: async (ydoc, current, docName) => {
+  update: async (ydoc, current, docName, closingAuth) => {
     const docType = getDocType(docName);
     const name = ydoc.name ?? docName;
     const cached = docs.get(name) === ydoc;
@@ -941,9 +1046,17 @@ export const persistence = {
 
       if (current !== content) {
         // Only store the document if it was actually changed.
-        const { ok, status, statusText } = await persistence.put(ydoc, content);
+        const { ok, status, statusText } = await persistence.put(ydoc, content, closingAuth);
         if (!roomIsCurrent()) {
           throw new Error('Room invalidated before the save completed; reload the document');
+        }
+
+        if (ok && ydoc.boundMode === HELIX6 && ydoc.etagUnverified) {
+          const error = new Error('Bound Source save did not return a strong ETag; reload the document');
+          if (cached) {
+            await discardRoom(ydoc, error);
+          }
+          throw error;
         }
 
         if (!ok) {
@@ -1065,7 +1178,7 @@ export const persistence = {
         // eslint-disable-next-line no-param-reassign
         ydoc.sourceFenced = true;
         // eslint-disable-next-line no-param-reassign
-        ydoc.etagUnverified = !hasSourceValidator(ydoc.etag);
+        ydoc.etagUnverified = !hasRoomValidator(ydoc, ydoc.etag);
       }
     }
     const fencedSource = isFencedSource(ydoc, docName);
@@ -1074,8 +1187,9 @@ export const persistence = {
     // Read the stored state from internal worker storage (snapshot errors are non-fatal).
     try {
       const timingBeforeReadState = Date.now();
-      const verifiedSnapshot = hasSourceValidator(sourceEtag) && sourceEtag === ydoc.etag
-        && !ydoc.etagUnverified;
+      const verifiedSnapshot = hasRoomValidator(ydoc, sourceEtag) && sourceEtag === ydoc.etag
+        && !ydoc.etagUnverified
+        && (!ydoc.boundMode || (await storage.get(FENCED_SOURCE_MODE)) === ydoc.boundMode);
       const stored = !fencedSource || verifiedSnapshot
         ? await readState(docName, storage, !fencedSource) : undefined;
       if (!roomIsCurrent()) {
@@ -1215,6 +1329,9 @@ export const persistence = {
 
       if (fencedSource || (isHelix && freshRoom)) {
         await restoreFromBackend();
+        if (ydoc.boundMode === HELIX6 && restoreError) {
+          throw restoreError;
+        }
       } else {
         restoreAfterDelay = new Promise((resolve) => {
           setTimeout(resolve, 1000);
@@ -1245,22 +1362,26 @@ export const persistence = {
     });
 
     let savingPromise = null;
-    const saveToAdmin = () => {
+    const canSave = (lastClose) => ydoc.boundMode !== HELIX6 || (lastClose
+      ? boundLastCloses.get(ydoc) === lastClose.id : ydoc.conns.size > 0);
+    const saveToAdmin = (lastClose) => {
       if (savingPromise) {
         return savingPromise;
       }
       if ((!current && !requiresSourceRestore)
-        || ydoc.discardPendingChanges || ydoc !== docs.get(docName)) {
+        || ydoc.discardPendingChanges || ydoc !== docs.get(docName) || !canSave(lastClose)) {
         return undefined;
       }
       savingPromise = Promise.resolve().then(async () => {
         if (requiresSourceRestore && restoreAfterDelay) {
           await restoreAfterDelay;
         }
-        if (restoreError || ydoc.discardPendingChanges || ydoc !== docs.get(docName)) {
+        // Recheck after yielding: a new peer can supersede a queued final flush.
+        if (restoreError || ydoc.discardPendingChanges || ydoc !== docs.get(docName)
+          || !canSave(lastClose)) {
           return;
         }
-        current = await persistence.update(ydoc, current, docName);
+        current = await persistence.update(ydoc, current, docName, lastClose?.auth);
         if (!ydoc.lastSaveError) {
           // eslint-disable-next-line no-param-reassign
           ydoc.hasClientChanged = false;
@@ -1271,14 +1392,14 @@ export const persistence = {
       return savingPromise;
     };
 
-    const debouncedSave = debounce(saveToAdmin, 2000, { maxWait: 10000 });
+    const debouncedSave = debounce(() => saveToAdmin(), 2000, { maxWait: 10000 });
     ydoc.on('update', (update, origin) => {
       if (origin !== ERROR_ORIGIN) {
         debouncedSave(update, origin);
       }
     });
 
-    ydoc.flushSave = async () => {
+    ydoc.flushSave = async (lastClose) => {
       debouncedSave.cancel();
       // If a save is already in flight, wait for it to complete before
       // starting a new one — ensures the ack is not sent before the PUT finishes.
@@ -1288,7 +1409,7 @@ export const persistence = {
           throw ydoc.lastSaveError;
         }
       }
-      await saveToAdmin();
+      await saveToAdmin(lastClose);
       if (ydoc.lastSaveError) {
         throw ydoc.lastSaveError;
       }
@@ -1417,15 +1538,31 @@ export const getYDoc = async (
   if (doc === undefined) {
     // The doc is not yet in the cache, create a new one.
     doc = new WSSharedDoc(docname);
+    doc.boundMode = conn.boundMode;
+    doc.DA_RS_ORIGIN = env.DA_RS_ORIGIN;
+    doc.dars = env.dars;
     doc.gc = gc;
     doc.sendStackTraces = String(env.RETURN_STACK_TRACES) === 'true';
     docs.set(docname, doc);
   }
 
+  if (doc.boundMode !== conn.boundMode) {
+    if (!waking) {
+      throw sourceError(412, 'Bound Source room transport changed; reload the document');
+    }
+    retiredConnections.add(conn);
+    await closeConn(doc, conn, true, RELOAD_CLOSE);
+    return undefined;
+  }
+
+  // Carry the da-admin binding and local override before selecting wake admission.
+  doc.daadmin = env.daadmin;
+  doc.IS_HELIX = env.IS_HELIX;
+
   const attachment = waking ? conn.deserializeAttachment?.() : undefined;
   const awaitingAdmission = waking && !doc.conns.has(conn)
     && !freshHibernationConnections.has(conn)
-    && (!isHelixDoc(docname, env) || !!attachment?.sourceSession);
+    && (!isHelixDoc(docname, doc) || !!attachment?.sourceSession);
   const requiresContinuity = () => isFencedSource(doc) || !!attachment?.sourceSession;
   const rejectWake = () => {
     if (!retiredConnections.has(conn)) {
@@ -1437,6 +1574,7 @@ export const getYDoc = async (
 
   // Do not register an unchecked socket: restoring Yjs can broadcast updates.
   if (!awaitingAdmission && !doc.conns.has(conn)) {
+    boundLastCloses.delete(doc);
     doc.conns.set(conn, new Set());
   }
 
@@ -1444,12 +1582,6 @@ export const getYDoc = async (
   // eslint-disable-next-line no-console
   console.log(`[docroom] Getting ydoc ${docname}`, `Connections (unique / total): ${uniqueConnections.size} / ${doc.conns.size}`);
 
-  // Store the service binding to da-admin which we receive through the environment in the doc
-  doc.daadmin = env.daadmin;
-  // Carry the IS_HELIX backend override too, so backend resolution can honour it
-  // without holding a reference to the whole environment. Together with daadmin,
-  // this makes the ydoc usable directly as the `env` argument to getBackend.
-  doc.IS_HELIX = env.IS_HELIX;
   if (!doc.promise) {
     // The doc is not yet bound to the persistence layer, do so now. The promise will be resolved
     // when bound.
@@ -1461,7 +1593,7 @@ export const getYDoc = async (
   try {
     const timings = await doc.promise;
     if (doc.discardPendingChanges) {
-      throw new Error('Room invalidated while loading; reload the document');
+      throw sourceError(412, 'Room invalidated while loading; reload the document');
     }
     if (timingData) {
       timings.forEach((v, k) => timingData.set(k, v));
@@ -1486,6 +1618,7 @@ export const getYDoc = async (
       return rejectWake();
     }
     if (!doc.conns.has(conn)) {
+      boundLastCloses.delete(doc);
       doc.conns.set(conn, new Set());
     }
   }

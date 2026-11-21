@@ -16,5 +16,6 @@ export interface Env {
     COLLAB_SHARED_SECRET: string;
     rooms: DurableObjectNamespace;
     daadmin: Fetcher /* da-admin */;
+    DA_RS_ORIGIN?: string;
+    dars?: Fetcher /* bound da-rs Source */;
 }
-

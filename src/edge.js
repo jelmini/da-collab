@@ -12,8 +12,12 @@
 // eslint-disable-next-line import/no-unresolved
 import { DurableObject } from 'cloudflare:workers';
 import {
+  BOUND_SOURCE_MODE, HELIX6, LEGACY, fetchBoundSource, isHelixSourcePath, readBoundSourceMode,
+  resolveBoundSource, sourceError,
+} from './bound-source.js';
+import {
   getBackend, handleWebSocketClose, handleWebSocketMessage,
-  invalidateFromAdmin, isHelixDoc, logError, setupWSConnection,
+  invalidateBoundFromAdmin, invalidateFromAdmin, isHelixDoc, logError, setupWSConnection,
 } from './shareddoc.js';
 
 /**
@@ -68,7 +72,7 @@ export async function handleErrors(request, env, handler) {
  * @param {Env} env
  */
 async function adminAPI(api, url, request, env) {
-  const doc = url.searchParams.get('doc');
+  let doc = url.searchParams.get('doc');
   if (!doc) {
     return new Response('Bad', { status: 400 });
   }
@@ -80,6 +84,18 @@ async function adminAPI(api, url, request, env) {
     }
   }
 
+  let apiUrl;
+  try {
+    const bound = resolveBoundSource(doc, env);
+    doc = bound?.canonical ?? doc;
+    apiUrl = new URL(doc);
+    if (apiUrl.username || apiUrl.password || apiUrl.search || apiUrl.hash
+      || (!bound && apiUrl.origin !== 'https://api.aem.live' && isHelixSourcePath(apiUrl))) {
+      return new Response('Invalid document URL', { status: 400 });
+    }
+  } catch (error) {
+    return new Response('Invalid document URL', { status: error.status ?? 400 });
+  }
   const id = env.rooms.idFromName(doc);
 
   // eslint-disable-next-line no-console
@@ -89,7 +105,6 @@ async function adminAPI(api, url, request, env) {
   // TODO: check for roomObject === null ?
   // note, that we cannot call DocRoom.handleApiCall directly w/o enabling
   // RPC on on the durable objects.
-  const apiUrl = new URL(doc);
   apiUrl.searchParams.set('api', api);
   return roomObject.fetch(new Request(apiUrl));
 }
@@ -171,6 +186,40 @@ export function wsAuthFailureResponse(reqHeaders, code, reason) {
   return new Response(null, { status: 101, headers: respHeaders, webSocket: client });
 }
 
+function roomRequestHeaders(request, docName, auth, authActions, boundMode, timing) {
+  const headers = new Headers(request.headers);
+  // None of these internal values may be supplied or merged in by the caller.
+  headers.delete('Authorization');
+  headers.delete(BOUND_SOURCE_MODE);
+  headers.delete('X-is-helix');
+  headers.set('X-collab-room', docName);
+  headers.set('X-auth-actions', authActions);
+  headers.set('X-timing-start', timing.start);
+  headers.set('X-timing-da-admin-head-duration', timing.head);
+  headers.set('X-timing-docroom-get-duration', timing.get);
+  if (auth) {
+    headers.set('Authorization', auth);
+  }
+  if (boundMode) {
+    headers.set(BOUND_SOURCE_MODE, boundMode);
+    const protocols = headers.get('sec-websocket-protocol')?.split(',').map((p) => p.trim());
+    headers.delete('sec-websocket-protocol');
+    if (protocols?.includes('yjs')) {
+      headers.set('sec-websocket-protocol', 'yjs');
+    }
+  }
+  return headers;
+}
+
+function validBoundContext(docName, env, mode) {
+  try {
+    const bound = resolveBoundSource(docName, env);
+    return bound ? bound.canonical === docName && [HELIX6, LEGACY].includes(mode) : !mode;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * This is where the requests for the worker come in. They can either be pure API requests or
  * requests to set up a session with a Durable Object through a Yjs WebSocket.
@@ -190,7 +239,7 @@ export async function handleApiRequest(request, env) {
   }
 
   const protocols = request.headers.get('sec-websocket-protocol')?.split(',');
-  const token = protocols?.find((hdr) => hdr !== 'yjs')?.trim();
+  const token = protocols?.map((hdr) => hdr.trim()).find((hdr) => hdr && hdr !== 'yjs');
   let auth = '';
   if (token) {
     auth = `Bearer ${token}`;
@@ -205,12 +254,27 @@ export async function handleApiRequest(request, env) {
     .replace('https:/admin.da.live', 'https://admin.da.live')
     .replace('http:/localhost', 'http://localhost');
 
-  if (docName.indexOf('?') > 0) {
-    docName = docName.substring(0, docName.indexOf('?'));
+  [docName] = docName.split('?');
+
+  let bound;
+  try {
+    bound = resolveBoundSource(docName, env);
+    const target = new URL(docName);
+    if (target.username || target.password
+      || (!bound && target.origin !== 'https://api.aem.live' && isHelixSourcePath(target))) {
+      return new Response('unable to get resource', { status: 404 });
+    }
+    if (bound && url.searchParams.has('contentBranch')) {
+      throw sourceError(422, 'Bound Source aliases do not support a branch query');
+    }
+  } catch (error) {
+    return new Response(error.status ? error.message : 'unable to get resource', {
+      status: error.status ?? 404,
+    });
   }
 
   // Make sure we only work with da.live, da.page or localhost
-  if (!docName.startsWith('https://admin.da.live/')
+  if (!bound && !docName.startsWith('https://admin.da.live/')
       && !docName.startsWith('https://admin.da.page/')
       && !docName.startsWith('https://stage-admin.da.live/')
       && !docName.startsWith('https://api.aem.live/')
@@ -221,6 +285,7 @@ export async function handleApiRequest(request, env) {
   // Check if we have the authorization for the room (this is a poor man's solution as right now
   // only da-admin knows).
   let authActions;
+  let boundMode;
   try {
     const opts = { method: 'HEAD' };
     if (auth) {
@@ -228,13 +293,14 @@ export async function handleApiRequest(request, env) {
     }
 
     const timingBeforeDaAdminHead = Date.now();
-    const initialReq = await getBackend(docName, env).fetch(docName, opts);
+    const initialReq = bound ? await fetchBoundSource(env, bound.requested, opts)
+      : await getBackend(docName, env).fetch(docName, opts);
 
     timingDaAdminHeadDuration = Date.now() - timingBeforeDaAdminHead;
 
     if (!initialReq.ok) {
       // eslint-disable-next-line no-console
-      console.log(`[worker] Unable to get resource ${docName}: ${initialReq.status} - ${initialReq.statusText}`);
+      console.log(`[worker] Unable to get resource ${docName}: ${initialReq.status}`);
       // For WebSocket upgrades, signal auth failures via a CloseEvent code so the
       // client can refresh its token and reconnect (4401) or stop trying (4403).
       // Otherwise the browser sees only a generic 1006.
@@ -246,7 +312,7 @@ export async function handleApiRequest(request, env) {
           return wsAuthFailureResponse(request.headers, 4403, 'forbidden');
         }
       }
-      const headers = initialReq.status >= 500
+      const headers = !bound && initialReq.status >= 500
         ? { 'x-error': initialReq.headers.get('x-error') ?? initialReq.statusText }
         : undefined;
       return new Response('unable to get resource', { status: initialReq.status, headers });
@@ -255,9 +321,17 @@ export async function handleApiRequest(request, env) {
     // this seems to be required by CloudFlare to consider the request as completed
     await initialReq.text();
 
+    if (bound) {
+      boundMode = readBoundSourceMode(initialReq.headers, bound.isHelixAlias);
+      docName = bound.canonical;
+    }
+
     const daActions = initialReq.headers.get('X-da-actions') ?? '';
     [, authActions] = daActions.split('=');
   } catch (err) {
+    if (bound) {
+      return new Response('Unable to authorize bound Source', { status: err.status ?? 503 });
+    }
     logError(err, `[worker] Unable to handle API request ${docName}`, err);
     return new Response('unable to get resource', { status: 500, headers: { 'x-error': err.message } });
   }
@@ -279,17 +353,9 @@ export async function handleApiRequest(request, env) {
     // eslint-disable-next-line no-console
     console.log('[worker] Fecthing', docName);
 
-    const headers = [...request.headers,
-      ['X-collab-room', docName],
-      ['X-timing-start', timingStartTime],
-      ['X-timing-da-admin-head-duration', timingDaAdminHeadDuration],
-      ['X-timing-docroom-get-duration', timingDocRoomGetDuration],
-      ['X-auth-actions', authActions],
-    ];
-
-    if (auth) {
-      headers.push(['Authorization', auth]);
-    }
+    const headers = roomRequestHeaders(request, docName, auth, authActions, boundMode, {
+      start: timingStartTime, head: timingDaAdminHeadDuration, get: timingDocRoomGetDuration,
+    });
     const createRequest = () => new Request(new URL(docName), { headers });
     // Send the request to the Durable Object. The `fetch()` method of a Durable Object stub has the
     // same signature as the global `fetch()` function, but the request is always sent to the
@@ -310,14 +376,17 @@ export async function handleApiRequest(request, env) {
       const response = await retryRoomObject.fetch(createRequest());
       if (response.status >= 500) {
         // eslint-disable-next-line no-console
-        console.error(`[worker] Durable Object WebSocket retry returned HTTP ${response.status}`, docName, response.headers.get('x-error'), err);
+        console.error(`[worker] Durable Object WebSocket retry returned HTTP ${response.status}`, docName, ...(!bound ? [response.headers.get('x-error'), err] : []));
       } else {
         // eslint-disable-next-line no-console
-        console.warn('[worker] Recovered Durable Object WebSocket fetch after transient error', docName, err);
+        console.warn('[worker] Recovered Durable Object WebSocket fetch after transient error', docName, ...(!bound ? [err] : []));
       }
       return response;
     }
   } catch (err) {
+    if (bound) {
+      return new Response('Unable to open bound Source room', { status: 500 });
+    }
     logError(err, `[worker] Error fetching the doc from the room ${docName}`, err);
     return new Response('unable to get resource', { status: 500, headers: { 'x-error': err.message } });
   }
@@ -358,15 +427,17 @@ export class DocRoom extends DurableObject {
    */
   // eslint-disable-next-line no-unused-vars
   async handleApiCall(api, docName, request) {
+    const invalidate = () => (resolveBoundSource(docName, this.env)
+      ? invalidateBoundFromAdmin(docName, this.ctx) : invalidateFromAdmin(docName));
     switch (api) {
       case 'deleteAdmin':
-        if (await invalidateFromAdmin(docName)) {
+        if (await invalidate()) {
           return new Response(null, { status: 204 });
         } else {
           return new Response('Not Found', { status: 404 });
         }
       case 'syncAdmin':
-        if (await invalidateFromAdmin(docName)) {
+        if (await invalidate()) {
           return new Response('OK', { status: 200 });
         } else {
           return new Response('Not Found', { status: 404 });
@@ -426,10 +497,15 @@ export class DocRoom extends DurableObject {
         return new Response('expected docName', { status: 400 });
       }
 
+      const boundMode = request.headers.get(BOUND_SOURCE_MODE);
+      if (!validBoundContext(docName, this.env, boundMode)) {
+        return new Response('Invalid bound Source context', { status: 503 });
+      }
+
       // Helix does not yet report auth actions, so grant collaborators
       // read,write; otherwise honour what da-admin reported.
       // TODO: remove the isHelixDoc branch once Helix reports auth actions.
-      const authActions = isHelixDoc(docName, this.env)
+      const authActions = !boundMode && isHelixDoc(docName, this.env)
         ? 'read,write'
         : request.headers.get('X-auth-actions') ?? '';
 
@@ -443,17 +519,23 @@ export class DocRoom extends DurableObject {
       // Register with CF Hibernation API: the DO can sleep between messages
       // without losing its WebSocket connections.
       this.ctx.acceptWebSocket(server);
-      server.serializeAttachment({ docName, auth, authActions });
+      server.serializeAttachment({
+        docName, auth, authActions, ...(boundMode && { boundMode }),
+      });
 
       server.auth = auth;
+      if (boundMode) {
+        server.boundMode = boundMode;
+      }
       if (!authActions.split(',').includes('write')) {
         // eslint-disable-next-line no-param-reassign
         server.readOnly = true;
       }
 
+      const authScheme = boundMode ? 'present' : auth?.substring(0, auth.indexOf(' '));
+      const authLabel = auth ? authScheme : 'none';
       // eslint-disable-next-line no-console
-      console.log(`[docroom] Setting up WSConnection for ${docName} with auth(${
-        auth ? auth.substring(0, auth.indexOf(' ')) : 'none'})`);
+      console.log(`[docroom] Setting up WSConnection for ${docName} with auth(${authLabel})`);
 
       // Kick off async document initialization; response is returned immediately.
       this.ctx.waitUntil(this.initSession(server, docName));
@@ -499,8 +581,16 @@ export class DocRoom extends DurableObject {
       } else {
         logError(err, '[docroom] Error during session setup', docName, err);
       }
+      if (webSocket.boundMode && [2, 3].includes(webSocket.readyState)) {
+        return; // An invalidation has already closed this socket with its reload code.
+      }
       try {
-        webSocket.close(1011, err.message);
+        if (webSocket.boundMode && [401, 403, 412].includes(err?.status)) {
+          const reason = err.status === 412 ? 'reload required' : 'authorization failed';
+          webSocket.close(4000 + err.status, reason);
+        } else {
+          webSocket.close(1011, err.message);
+        }
       } catch (_) { /* already closed */ }
     }
   }
@@ -512,7 +602,17 @@ export class DocRoom extends DurableObject {
    * @param {ArrayBuffer|string} message
    */
   async webSocketMessage(webSocket, message) {
-    const { docName, auth, authActions } = webSocket.deserializeAttachment();
+    const attachment = webSocket.deserializeAttachment();
+    if (!attachment?.docName
+      || !validBoundContext(attachment.docName, this.env, attachment.boundMode)) {
+      webSocket.close(4412, 'reload required');
+      return;
+    }
+    const {
+      docName, auth, authActions, boundMode,
+    } = attachment;
+    // eslint-disable-next-line no-param-reassign
+    webSocket.boundMode = boundMode;
     // eslint-disable-next-line no-param-reassign
     webSocket.auth = auth;
     if (!authActions.split(',').includes('write')) {
