@@ -19,7 +19,9 @@ import {
 } from '@adobe/da-parser';
 import debounce from './debounce.js';
 import {
-  HELIX6, fetchBoundSource, hasStrongEtag, readBoundSourceMode, resolveBoundSource, sourceError,
+  HELIX6, LEGACY, fetchBoundSource, fetchBoundTransport, hasStrongEtag, readBoundAdmission,
+  readBoundBranchHead, readBoundSourceMode, readBranchSourceBaseline, resolveBoundSource,
+  sourceError,
 } from './bound-source.js';
 
 const wsReadyStateConnecting = 0;
@@ -89,7 +91,8 @@ function getLocalTestBackendOverride(env) {
  * @param {object} [env] - the worker environment (may carry `IS_HELIX`)
  */
 export const isHelixDoc = (docName, env) => !env?.boundMode
-  && (getLocalTestBackendOverride(env)?.isHelix ?? docName.startsWith('https://api.aem.live/'));
+  && (getLocalTestBackendOverride(env)?.isHelix ?? docName.startsWith('https://api.aem.live/'))
+  && !resolveBoundSource(docName, env)?.branch;
 
 function boundBackend(env) {
   return (url, opts) => {
@@ -119,12 +122,18 @@ function boundBackend(env) {
 export function getBackend(docName, env) {
   const localTestOverride = getLocalTestBackendOverride(env);
   const isHelix = isHelixDoc(docName, env);
+  const qualifiedDA = !env?.boundMode && resolveBoundSource(docName, env)?.branch;
+  let fetch = boundBackend(env);
+  if (qualifiedDA) {
+    fetch = (url, opts) => fetchBoundTransport(env.daadmin, url, opts);
+  } else if (!env?.boundMode) {
+    fetch = (url, opts) => (isHelix ? globalThis : env.daadmin)
+      .fetch(localTestOverride?.rewriteUrl(url) ?? url, opts);
+  }
 
   return {
     // A fetch that already knows where to go.
-    fetch: env?.boundMode ? boundBackend(env)
-      : (url, opts) => (isHelix ? globalThis : env.daadmin)
-        .fetch(localTestOverride?.rewriteUrl(url) ?? url, opts),
+    fetch,
 
     // Build the body (and any body-specific headers) for a content PUT.
     // Helix takes the raw content with an explicit Content-Type; da-admin takes
@@ -178,6 +187,7 @@ const ERROR_ORIGIN = Symbol('error-notification');
 const FENCED_SOURCE_ETAG = 'fencedSourceEtag';
 const FENCED_SOURCE_SESSION = 'fencedSourceSession';
 const FENCED_SOURCE_MODE = 'fencedSourceMode';
+const FENCED_SOURCE_INSTANCE = 'fencedSourceInstance';
 const RELOAD_CLOSE = { code: 4412, reason: 'reload required' };
 const MAX_STORAGE_KEYS = 128;
 const MAX_STORAGE_VALUE_SIZE = 131072;
@@ -400,6 +410,7 @@ export const readState = async (docName, storage, clearOnMismatch = true) => {
  * @param {string|null} [sourceEtag] - Exact Source validator for this snapshot (null = unverified).
  * @param {string} [sourceSession] - Socket continuity identity for a fenced snapshot.
  * @param {string} [sourceMode] - Bound transport used to create a fenced snapshot.
+ * @param {string} [sourceInstance] - Qualified H6 branch incarnation of this snapshot.
  */
 export const storeState = async (
   docName,
@@ -409,6 +420,7 @@ export const storeState = async (
   sourceEtag = undefined,
   sourceSession = undefined,
   sourceMode = undefined,
+  sourceInstance = undefined,
 ) => {
   const oldChunkCount = await storage.get('chunks');
 
@@ -428,7 +440,8 @@ export const storeState = async (
 
     // Keep the validator and session identity atomic with the snapshot.
     const maxChunks = MAX_STORAGE_KEYS - (sourceEtag === undefined ? 1 : 3)
-      - Number(sourceSession !== undefined) - Number(sourceMode !== undefined);
+      - Number(sourceSession !== undefined) - Number(sourceMode !== undefined)
+      - Number(sourceInstance !== undefined);
     if (j > maxChunks) {
       // eslint-disable-next-line no-console
       console.error('[docroom] Object too big for worker storage', docName, j, MAX_STORAGE_KEYS);
@@ -451,6 +464,9 @@ export const storeState = async (
   }
   if (sourceMode !== undefined) {
     serialized[FENCED_SOURCE_MODE] = sourceMode;
+  }
+  if (sourceInstance !== undefined) {
+    serialized[FENCED_SOURCE_INSTANCE] = sourceInstance;
   }
 
   await storage.put(serialized);
@@ -486,6 +502,7 @@ function storeSourceState(ydoc, docName = ydoc.name) {
         sourceEtag,
         ydoc.sourceSession,
         sourceEtag === undefined ? undefined : ydoc.boundMode,
+        ydoc.sourceInstance,
       );
     }
     return undefined;
@@ -502,6 +519,7 @@ function purgeSourceState(ydoc) {
     const chunks = await storage.get('chunks');
     await storage.delete([
       'doc', 'docstore', 'chunks', 'lastsync', FENCED_SOURCE_SESSION, FENCED_SOURCE_MODE,
+      FENCED_SOURCE_INSTANCE,
     ]);
     if (chunks) {
       await storage.delete(Array.from({ length: chunks }, (_, i) => `chunk_${i}`));
@@ -571,7 +589,9 @@ function discardRoom(ydoc, error) {
         await storage?.delete?.('lastsync');
       }
     } finally {
-      discardingRooms.delete(name);
+      if (discardingRooms.get(name) === cleanup) {
+        discardingRooms.delete(name);
+      }
     }
   });
   discardingRooms.set(name, cleanup);
@@ -619,13 +639,14 @@ export const invalidateFromAdmin = async (docName, discardPendingChanges = false
   return false;
 };
 
-/** Admin notices can arrive while the object is asleep and no Y.Doc is cached. */
-export async function invalidateBoundFromAdmin(docName, ctx) {
+/** Invalidate a room even when it is asleep. A wake may invalidate only its own session. */
+export async function invalidateBoundFromAdmin(docName, ctx, sourceSession) {
   const doc = docs.get(docName);
   let retired = false;
   for (const conn of ctx?.getWebSockets?.() ?? []) {
     const attachment = conn.deserializeAttachment();
     if (attachment?.docName === docName
+      && (!sourceSession || attachment.sourceSession === sourceSession)
       && (attachment.boundMode === HELIX6 || attachment.sourceSession)
       && !retiredConnections.has(conn) && !doc?.conns.has(conn)) {
       retiredConnections.add(conn);
@@ -637,6 +658,9 @@ export async function invalidateBoundFromAdmin(docName, ctx) {
   }
   const { storage } = ctx ?? {};
   if (doc || !storage) {
+    if (sourceSession && doc?.sourceSession !== sourceSession) {
+      return retired;
+    }
     return (await invalidateFromAdmin(docName)) || retired;
   }
   const discarding = discardingRooms.get(docName);
@@ -646,12 +670,19 @@ export async function invalidateBoundFromAdmin(docName, ctx) {
   }
   const cleanup = Promise.resolve().then(async () => {
     await sourceStorageTails.get(storage);
+    if (sourceSession && (await storage.get(FENCED_SOURCE_SESSION)) !== sourceSession) {
+      return retired;
+    }
     if (retired || (await storage.get(FENCED_SOURCE_ETAG)) !== undefined) {
       await purgeSourceState({ name: docName, storage });
       return true;
     }
     return false;
-  }).finally(() => discardingRooms.delete(docName));
+  }).finally(() => {
+    if (discardingRooms.get(docName) === cleanup) {
+      discardingRooms.delete(docName);
+    }
+  });
   discardingRooms.set(docName, cleanup);
   return cleanup;
 }
@@ -711,6 +742,29 @@ async function getHelixEtagBaseline(backend, docName, opts, initialResponse) {
   }
 }
 
+function readRoomBranchEtag(ydoc, headers) {
+  readBoundSourceMode(headers, true);
+  const { instance, etag } = readBranchSourceBaseline(headers, ydoc.boundBranch);
+  if (instance !== ydoc.sourceInstance) {
+    throw sourceError(412, 'Bound Source branch instance changed');
+  }
+  return etag;
+}
+
+const isBranchUnavailable = (status) => status === 404 || status === 422;
+
+async function isBranchModeMismatch(response) {
+  if (response.status !== 409) {
+    return false;
+  }
+  try {
+    const payload = await response.json();
+    return payload?.error?.code === 'SOURCE_MODE_MISMATCH';
+  } catch {
+    return false;
+  }
+}
+
 export const persistence = {
   closeConn,
 
@@ -734,10 +788,28 @@ export const persistence = {
     const isHelix = isHelixDoc(docName, ydoc);
     let initialReq = await backend.fetch(docName, initalOpts);
     let etag;
-    if (ydoc.boundMode && initialReq.ok) {
+    if (ydoc.sourceInstance) {
       try {
-        const mode = readBoundSourceMode(initialReq.headers, ydoc.boundMode === HELIX6);
-        if (mode !== ydoc.boundMode) {
+        if (initialReq.ok) {
+          if (readRoomBranchEtag(ydoc, initialReq.headers) !== ydoc.sourceAdmissionEtag) {
+            throw sourceError(412, 'Bound Source branch validator changed');
+          }
+        } else if (isBranchUnavailable(initialReq.status)
+          || (await isBranchModeMismatch(initialReq))) {
+          throw sourceError(412, 'Bound Source branch became unavailable');
+        }
+      } catch {
+        if (!initialReq.bodyUsed) {
+          initialReq.body?.cancel();
+        }
+        throw sourceError(412, 'Bound Source branch changed during load; reload the document');
+      }
+    } else if ((ydoc.boundMode || ydoc.boundBranch) && initialReq.ok) {
+      try {
+        const mode = ydoc.boundBranch
+          ? readBoundAdmission(initialReq.headers, { branch: ydoc.boundBranch }).mode
+          : readBoundSourceMode(initialReq.headers, ydoc.boundMode === HELIX6);
+        if (mode !== (ydoc.boundMode ?? LEGACY)) {
           throw sourceError(412, 'Bound Source mode changed; reload the document');
         }
         if (mode === HELIX6 && !hasStrongEtag(initialReq.headers.get('etag'))) {
@@ -745,6 +817,9 @@ export const persistence = {
         }
       } catch (error) {
         initialReq.body?.cancel();
+        if (ydoc.boundBranch) {
+          throw sourceError(412, 'Bound Source branch changed during DA load; reload the document');
+        }
         throw error;
       }
     }
@@ -854,9 +929,9 @@ export const persistence = {
       console.warn('[docroom] Writing back an empty document', ydoc.name, bodySize);
     }
 
-    if (isHelix) {
-      // Any HEAD overlapping a Helix write is too old to invalidate this session,
-      // even when the backend omits an ETag or returns the same one.
+    const trackPut = isHelix || ydoc.sourceInstance;
+    if (trackPut) {
+      // Any HEAD overlapping a write is too old to invalidate this session.
       // eslint-disable-next-line no-param-reassign
       ydoc.saveGeneration = (ydoc.saveGeneration ?? 0) + 1;
       // eslint-disable-next-line no-param-reassign
@@ -867,7 +942,7 @@ export const persistence = {
     try {
       response = await backend.fetch(ydoc.name, opts);
     } finally {
-      if (isHelix) {
+      if (trackPut) {
         // eslint-disable-next-line no-param-reassign
         ydoc.pendingPuts -= 1;
       }
@@ -876,8 +951,21 @@ export const persistence = {
       ok, status, statusText, body, headers: respHeaders,
     } = response;
 
+    let branchConflict = false;
+    if (ydoc.sourceInstance && !ydoc.discardPendingChanges) {
+      if (ok) {
+        try {
+          // A qualified PUT must advance the exact strong validator used for If-Match.
+          branchConflict = readRoomBranchEtag(ydoc, respHeaders) === storedEtag;
+        } catch {
+          branchConflict = true;
+        }
+      } else {
+        branchConflict = isBranchUnavailable(status) || (await isBranchModeMismatch(response));
+      }
+    }
     const stillCurrent = !ydoc.discardPendingChanges && (!cached || docs.get(ydoc.name) === ydoc);
-    if (ok && stillCurrent && !legacy) {
+    if (ok && stillCurrent && !legacy && !branchConflict) {
       const etag = respHeaders.get('etag');
       if (isHelix || hasRoomValidator(ydoc, etag)) {
         // eslint-disable-next-line no-param-reassign
@@ -892,14 +980,14 @@ export const persistence = {
       }
     }
 
-    if (body) {
+    if (body && !response.bodyUsed) {
       // tell CloudFlare to consider the request as completed
       body.cancel();
     }
 
     return {
-      ok,
-      status,
+      ok: ok && !branchConflict,
+      status: branchConflict ? 412 : status,
       statusText: ydoc.boundMode ? '' : statusText,
     };
   },
@@ -1189,7 +1277,10 @@ export const persistence = {
       const timingBeforeReadState = Date.now();
       const verifiedSnapshot = hasRoomValidator(ydoc, sourceEtag) && sourceEtag === ydoc.etag
         && !ydoc.etagUnverified
-        && (!ydoc.boundMode || (await storage.get(FENCED_SOURCE_MODE)) === ydoc.boundMode);
+        && (!(ydoc.boundMode || ydoc.boundBranch)
+          || (await storage.get(FENCED_SOURCE_MODE)) === ydoc.boundMode)
+        && (!ydoc.boundBranch
+          || (await storage.get(FENCED_SOURCE_INSTANCE)) === ydoc.sourceInstance);
       const stored = !fencedSource || verifiedSnapshot
         ? await readState(docName, storage, !fencedSource) : undefined;
       if (!roomIsCurrent()) {
@@ -1503,6 +1594,84 @@ export class WSSharedDoc extends Y.Doc {
   }
 }
 
+function rejectWake(conn) {
+  if (!retiredConnections.has(conn)) {
+    retiredConnections.add(conn);
+    try {
+      conn.close(RELOAD_CLOSE.code, RELOAD_CLOSE.reason);
+    } catch { /* already closed */ }
+  }
+  return undefined;
+}
+
+function matchesBranchAdmission(doc, admission) {
+  return (doc.boundMode ?? LEGACY) === admission.mode && doc.sourceInstance === admission.instance
+    && (!admission.instance || (!doc.etagUnverified && doc.etag === admission.etag));
+}
+
+async function retireObsoleteBranchRoom(doc, target, env, auth) {
+  if (doc.pendingPuts > 0) {
+    return;
+  }
+  const generation = doc.saveGeneration;
+  let latest;
+  try {
+    latest = await readBoundBranchHead(target, env, auth);
+  } catch {
+    return; // A failed or unauthorized check isn't evidence against the current room.
+  }
+  // Do not let a late HEAD retire a successor or race an acknowledged PUT.
+  if (docs.get(doc.name) === doc && !doc.discardPendingChanges && doc.saveGeneration === generation
+    && !matchesBranchAdmission(doc, latest)) {
+    await discardRoom(doc);
+  }
+}
+
+async function revalidateWakingBranch(docName, target, env, conn, ctx, attached) {
+  let latest;
+  try {
+    latest = await readBoundBranchHead(target, env, conn.auth);
+  } catch {
+    // Pre-H6 DA attachments carry no mode. An unavailable trusted classifier
+    // cannot distinguish an ordinary branch from one that now requires H6.
+    return rejectWake(conn);
+  }
+  const { boundMode, sourceInstance, sourceSession } = attached ?? {};
+  if (latest.unavailable || latest.mode !== (boundMode ?? LEGACY)
+    || latest.instance !== sourceInstance) {
+    rejectWake(conn);
+    // Re-enabling the gate need not change the item ETag. Retire the observed
+    // session, but never a newer one opened while HEAD was in flight.
+    if (sourceSession) {
+      await invalidateBoundFromAdmin(docName, ctx, sourceSession);
+    }
+    return undefined;
+  }
+  if (!latest.authActions.split(',').includes('write')) {
+    // Never broaden the authorizations attached to the socket.
+    // eslint-disable-next-line no-param-reassign
+    conn.readOnly = true;
+  }
+  return latest;
+}
+
+function registerConnection(doc, conn) {
+  boundLastCloses.delete(doc);
+  doc.conns.set(conn, new Set());
+  // eslint-disable-next-line no-param-reassign
+  doc.hadConnection = true;
+}
+
+function finishBranchJoin(doc) {
+  // Admission owns only rooms that never had a peer. Once a peer joins,
+  // closeConn owns empty-room cleanup, including a legacy last-close save.
+  // removeRoom checks the cache identity before dropping its entry.
+  doc.pendingBranchJoins -= 1;
+  if (!doc.pendingBranchJoins && !doc.hadConnection && !doc.conns.size) {
+    removeRoom(doc);
+  }
+}
+
 /**
  *
  * @param {string} docname - The name of the document
@@ -1524,21 +1693,40 @@ export const getYDoc = async (
   gc = true,
   waking = false,
 ) => {
+  if (waking && retiredConnections.has(conn)) {
+    return undefined;
+  }
+  const target = resolveBoundSource(docname, env);
+  const branch = target?.branch;
+  const resuming = waking && !freshHibernationConnections.has(conn);
+  const attachment = resuming ? conn.deserializeAttachment?.() : undefined;
+  let admission = {
+    mode: conn.boundMode ?? LEGACY, instance: conn.sourceInstance, etag: conn.sourceAdmissionEtag,
+  };
+  if (branch && resuming && !docs.get(docname)?.conns.has(conn)) {
+    admission = await revalidateWakingBranch(docname, target, env, conn, ctx, attachment);
+    if (!admission) {
+      return undefined;
+    }
+  }
   while (discardingRooms.has(docname)) {
     // eslint-disable-next-line no-await-in-loop
     await discardingRooms.get(docname);
   }
-  if (retiredConnections.has(conn)) {
+  if (retiredConnections.has(conn) || (branch && conn.readyState > wsReadyStateOpen)) {
     if (waking) {
       return undefined;
     }
-    throw new Error('Connection invalidated; reconnect to reload the document');
+    throw sourceError(412, 'Connection invalidated; reconnect to reload the document');
   }
   let doc = docs.get(docname);
   if (doc === undefined) {
     // The doc is not yet in the cache, create a new one.
     doc = new WSSharedDoc(docname);
     doc.boundMode = conn.boundMode;
+    doc.boundBranch = branch;
+    doc.sourceInstance = admission.instance;
+    doc.sourceAdmissionEtag = admission.etag;
     doc.DA_RS_ORIGIN = env.DA_RS_ORIGIN;
     doc.dars = env.dars;
     doc.gc = gc;
@@ -1546,36 +1734,30 @@ export const getYDoc = async (
     docs.set(docname, doc);
   }
 
-  if (doc.boundMode !== conn.boundMode) {
+  if (!branch && doc.boundMode !== conn.boundMode) {
     if (!waking) {
       throw sourceError(412, 'Bound Source room transport changed; reload the document');
     }
-    retiredConnections.add(conn);
-    await closeConn(doc, conn, true, RELOAD_CLOSE);
-    return undefined;
+    return rejectWake(conn);
   }
 
   // Carry the da-admin binding and local override before selecting wake admission.
   doc.daadmin = env.daadmin;
   doc.IS_HELIX = env.IS_HELIX;
 
-  const attachment = waking ? conn.deserializeAttachment?.() : undefined;
-  const awaitingAdmission = waking && !doc.conns.has(conn)
-    && !freshHibernationConnections.has(conn)
+  const awaitingWake = resuming && !doc.conns.has(conn)
     && (!isHelixDoc(docname, doc) || !!attachment?.sourceSession);
+  const needsBranchAdmission = branch && (conn.sourceInstance || doc.sourceInstance);
+  const awaitingAdmission = awaitingWake || (needsBranchAdmission && !doc.conns.has(conn));
   const requiresContinuity = () => isFencedSource(doc) || !!attachment?.sourceSession;
-  const rejectWake = () => {
-    if (!retiredConnections.has(conn)) {
-      retiredConnections.add(conn);
-      closeConn(doc, conn, true, RELOAD_CLOSE);
-    }
-    return undefined;
-  };
+  const trackBranchJoin = branch && awaitingAdmission;
+  if (trackBranchJoin) {
+    doc.pendingBranchJoins = (doc.pendingBranchJoins ?? 0) + 1;
+  }
 
   // Do not register an unchecked socket: restoring Yjs can broadcast updates.
   if (!awaitingAdmission && !doc.conns.has(conn)) {
-    boundLastCloses.delete(doc);
-    doc.conns.set(conn, new Set());
+    registerConnection(doc, conn);
   }
 
   const uniqueConnections = new Set(doc.conns.keys().toArray().map((c) => c.auth || 'none'));
@@ -1588,41 +1770,53 @@ export const getYDoc = async (
     doc.promise = persistence.bindState(docname, doc, conn, storage, ctx);
   }
 
-  // We wait for the promise, for second and subsequent connections to the same doc, this will
-  // already be resolved.
   try {
-    const timings = await doc.promise;
-    if (doc.discardPendingChanges) {
-      throw sourceError(412, 'Room invalidated while loading; reload the document');
+    try {
+      const timings = await doc.promise;
+      if (doc.discardPendingChanges) {
+        throw sourceError(412, 'Room invalidated while loading; reload the document');
+      }
+      if (timingData) {
+        timings.forEach((v, k) => timingData.set(k, v));
+      }
+    } catch (e) {
+      // Do not let destroy's awareness broadcast try to send to this socket.
+      doc.conns.delete(conn);
+      removeRoom(doc);
+      if ((waking && branch) || (awaitingWake && requiresContinuity())) {
+        return rejectWake(conn);
+      }
+      throw e;
     }
-    if (timingData) {
-      timings.forEach((v, k) => timingData.set(k, v));
+    if (awaitingAdmission) {
+      if (retiredConnections.has(conn) || (branch && conn.readyState > wsReadyStateOpen)
+        || doc.isDestroyed || docs.get(docname) !== doc) {
+        if (waking) {
+          return rejectWake(conn);
+        }
+        throw sourceError(412, 'Room invalidated during admission; reload the document');
+      }
+      if (branch && !matchesBranchAdmission(doc, admission)) {
+        await retireObsoleteBranchRoom(doc, target, env, conn.auth);
+        if (waking) {
+          return rejectWake(conn);
+        }
+        throw sourceError(412, 'Bound Source branch room changed; reload the document');
+      }
+      if (awaitingWake && requiresContinuity() && (!doc.sourceSession || doc.etagUnverified
+        || attachment?.sourceSession !== doc.sourceSession)) {
+        return rejectWake(conn);
+      }
+      if (!doc.conns.has(conn)) {
+        registerConnection(doc, conn);
+      }
     }
-  } catch (e) {
-    // Remove the connection before destroy to prevent the awareness broadcast
-    // (triggered by destroy) from calling send() → closeConn() on this conn.
-    doc.conns.delete(conn);
-    // ensure to cleanup event handlers and timers
-    removeRoom(doc);
-    if (awaitingAdmission && requiresContinuity()) {
-      return rejectWake();
+    return doc;
+  } finally {
+    if (trackBranchJoin) {
+      finishBranchJoin(doc);
     }
-    throw e;
   }
-  if (awaitingAdmission) {
-    if (retiredConnections.has(conn) || doc.isDestroyed || docs.get(docname) !== doc) {
-      return undefined;
-    }
-    if (requiresContinuity() && (!doc.sourceSession || doc.etagUnverified
-      || attachment?.sourceSession !== doc.sourceSession)) {
-      return rejectWake();
-    }
-    if (!doc.conns.has(conn)) {
-      boundLastCloses.delete(doc);
-      doc.conns.set(conn, new Set());
-    }
-  }
-  return doc;
 };
 
 // For testing
@@ -1809,10 +2003,18 @@ export const handleWebSocketMessage = async (conn, docName, env, storage, messag
   }
   const cached = docs.get(docName);
   // Check every unregistered socket, even when a different socket already rehydrated the room.
-  const doc = cached?.conns.has(conn) ? cached
+  const alreadyAdmitted = cached?.conns.has(conn);
+  const doc = alreadyAdmitted ? cached
     : await getYDoc(docName, conn, env, storage, undefined, ctx, true, true);
-  if (cached === doc && doc?.promise) {
-    await doc.promise;
+  if (alreadyAdmitted && doc.promise) {
+    try {
+      await doc.promise;
+    } catch (error) {
+      if (!doc.boundBranch) {
+        throw error;
+      }
+      return; // A fresh qualified DA session closes from initSession on bind failure.
+    }
   }
   if (doc && doc === docs.get(docName) && !doc.isDestroyed && !retiredConnections.has(conn)) {
     if (!cached) {
@@ -1833,6 +2035,9 @@ export const handleWebSocketMessage = async (conn, docName, env, storage, messag
  * @param {string} docName - The document name
  */
 export const handleWebSocketClose = async (conn, docName) => {
+  if (conn.sourceInstance) {
+    retiredConnections.add(conn); // Qualified admission does not register until verified.
+  }
   const doc = docs.get(docName);
   if (doc) {
     await closeConn(doc, conn);

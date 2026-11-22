@@ -12,8 +12,9 @@
 // eslint-disable-next-line import/no-unresolved
 import { DurableObject } from 'cloudflare:workers';
 import {
-  BOUND_SOURCE_MODE, HELIX6, LEGACY, fetchBoundSource, isHelixSourcePath, readBoundSourceMode,
-  resolveBoundSource, sourceError,
+  BOUND_SOURCE_ETAG, BOUND_SOURCE_INSTANCE, BOUND_SOURCE_MODE, HELIX6, LEGACY, fetchBoundSource,
+  hasBranchInstance, hasStrongEtag, isHelixSourcePath, readBoundAdmission, resolveBoundSource,
+  sourceError,
 } from './bound-source.js';
 import {
   getBackend, handleWebSocketClose, handleWebSocketMessage,
@@ -87,7 +88,10 @@ async function adminAPI(api, url, request, env) {
   let apiUrl;
   try {
     const bound = resolveBoundSource(doc, env);
-    doc = bound?.canonical ?? doc;
+    // Qualified DA notices already carry the room key. Do not fold an old DA room.
+    if (bound && (!bound.branch || bound.isHelixAlias)) {
+      doc = bound.canonical;
+    }
     apiUrl = new URL(doc);
     if (apiUrl.username || apiUrl.password || apiUrl.search || apiUrl.hash
       || (!bound && apiUrl.origin !== 'https://api.aem.live' && isHelixSourcePath(apiUrl))) {
@@ -186,11 +190,14 @@ export function wsAuthFailureResponse(reqHeaders, code, reason) {
   return new Response(null, { status: 101, headers: respHeaders, webSocket: client });
 }
 
-function roomRequestHeaders(request, docName, auth, authActions, boundMode, timing) {
+function roomRequestHeaders(request, docName, auth, authActions, admission, timing) {
   const headers = new Headers(request.headers);
   // None of these internal values may be supplied or merged in by the caller.
   headers.delete('Authorization');
   headers.delete(BOUND_SOURCE_MODE);
+  headers.delete(BOUND_SOURCE_INSTANCE);
+  headers.delete(BOUND_SOURCE_ETAG);
+  headers.delete('X-DA-Branch-Instance');
   headers.delete('X-is-helix');
   headers.set('X-collab-room', docName);
   headers.set('X-auth-actions', authActions);
@@ -200,8 +207,14 @@ function roomRequestHeaders(request, docName, auth, authActions, boundMode, timi
   if (auth) {
     headers.set('Authorization', auth);
   }
-  if (boundMode) {
-    headers.set(BOUND_SOURCE_MODE, boundMode);
+  if (admission?.mode) {
+    headers.set(BOUND_SOURCE_MODE, admission.mode);
+    if (admission.instance) {
+      headers.set(BOUND_SOURCE_INSTANCE, admission.instance);
+      headers.set(BOUND_SOURCE_ETAG, admission.etag);
+    }
+  }
+  if (admission) {
     const protocols = headers.get('sec-websocket-protocol')?.split(',').map((p) => p.trim());
     headers.delete('sec-websocket-protocol');
     if (protocols?.includes('yjs')) {
@@ -211,10 +224,18 @@ function roomRequestHeaders(request, docName, auth, authActions, boundMode, timi
   return headers;
 }
 
-function validBoundContext(docName, env, mode) {
+function validBoundContext(docName, env, mode, instance) {
   try {
     const bound = resolveBoundSource(docName, env);
-    return bound ? bound.canonical === docName && [HELIX6, LEGACY].includes(mode) : !mode;
+    if (!mode) {
+      // Old qualified DA attachments have no bound marker. They must reauthorize on wake.
+      return !instance && (!bound || (bound.branch !== undefined && !bound.isHelixAlias));
+    }
+    if (bound?.canonical !== docName) {
+      return false;
+    }
+    return bound.branch ? mode === HELIX6 && hasBranchInstance(instance)
+      : !instance && [HELIX6, LEGACY].includes(mode);
   } catch {
     return false;
   }
@@ -285,7 +306,7 @@ export async function handleApiRequest(request, env) {
   // Check if we have the authorization for the room (this is a poor man's solution as right now
   // only da-admin knows).
   let authActions;
-  let boundMode;
+  let admission;
   try {
     const opts = { method: 'HEAD' };
     if (auth) {
@@ -293,9 +314,26 @@ export async function handleApiRequest(request, env) {
     }
 
     const timingBeforeDaAdminHead = Date.now();
-    const initialReq = bound ? await fetchBoundSource(env, bound.requested, opts)
+    let initialReq = bound ? await fetchBoundSource(env, bound.requested, opts)
       : await getBackend(docName, env).fetch(docName, opts);
 
+    if (bound && initialReq.ok) {
+      await initialReq.text();
+      admission = readBoundAdmission(initialReq.headers, bound);
+      if (bound.branch && admission.mode === LEGACY) {
+        // The bound classification is not an authorization grant for the old DA backend.
+        admission = {};
+        initialReq = await getBackend(docName, env).fetch(docName, opts);
+        if (initialReq.ok) {
+          await initialReq.text();
+          if (readBoundAdmission(initialReq.headers, bound).mode !== LEGACY) {
+            throw sourceError(503, 'Bound Source mode changed during authorization');
+          }
+        }
+      } else if (admission.instance && !bound.canonical) {
+        throw sourceError(400, 'Use a canonical bound Source branch scope and document path');
+      }
+    }
     timingDaAdminHeadDuration = Date.now() - timingBeforeDaAdminHead;
 
     if (!initialReq.ok) {
@@ -319,10 +357,11 @@ export async function handleApiRequest(request, env) {
     }
 
     // this seems to be required by CloudFlare to consider the request as completed
-    await initialReq.text();
+    if (!admission) {
+      await initialReq.text();
+    }
 
-    if (bound) {
-      boundMode = readBoundSourceMode(initialReq.headers, bound.isHelixAlias);
+    if (admission?.mode) {
       docName = bound.canonical;
     }
 
@@ -353,7 +392,7 @@ export async function handleApiRequest(request, env) {
     // eslint-disable-next-line no-console
     console.log('[worker] Fecthing', docName);
 
-    const headers = roomRequestHeaders(request, docName, auth, authActions, boundMode, {
+    const headers = roomRequestHeaders(request, docName, auth, authActions, admission, {
       start: timingStartTime, head: timingDaAdminHeadDuration, get: timingDocRoomGetDuration,
     });
     const createRequest = () => new Request(new URL(docName), { headers });
@@ -498,7 +537,11 @@ export class DocRoom extends DurableObject {
       }
 
       const boundMode = request.headers.get(BOUND_SOURCE_MODE);
-      if (!validBoundContext(docName, this.env, boundMode)) {
+      const sourceInstance = request.headers.get(BOUND_SOURCE_INSTANCE);
+      const sourceAdmissionEtag = request.headers.get(BOUND_SOURCE_ETAG) ?? undefined;
+      const validEtag = sourceInstance
+        ? hasStrongEtag(sourceAdmissionEtag) : sourceAdmissionEtag === undefined;
+      if (!validBoundContext(docName, this.env, boundMode, sourceInstance) || !validEtag) {
         return new Response('Invalid bound Source context', { status: 503 });
       }
 
@@ -520,12 +563,20 @@ export class DocRoom extends DurableObject {
       // without losing its WebSocket connections.
       this.ctx.acceptWebSocket(server);
       server.serializeAttachment({
-        docName, auth, authActions, ...(boundMode && { boundMode }),
+        docName,
+        auth,
+        authActions,
+        ...(boundMode && { boundMode }),
+        ...(sourceInstance && { sourceInstance }),
       });
 
       server.auth = auth;
       if (boundMode) {
         server.boundMode = boundMode;
+      }
+      if (sourceInstance) {
+        server.sourceInstance = sourceInstance;
+        server.sourceAdmissionEtag = sourceAdmissionEtag;
       }
       if (!authActions.split(',').includes('write')) {
         // eslint-disable-next-line no-param-reassign
@@ -585,7 +636,8 @@ export class DocRoom extends DurableObject {
         return; // An invalidation has already closed this socket with its reload code.
       }
       try {
-        if (webSocket.boundMode && [401, 403, 412].includes(err?.status)) {
+        const branchConflict = err?.status === 412 && resolveBoundSource(docName, this.env)?.branch;
+        if ((webSocket.boundMode && [401, 403, 412].includes(err?.status)) || branchConflict) {
           const reason = err.status === 412 ? 'reload required' : 'authorization failed';
           webSocket.close(4000 + err.status, reason);
         } else {
@@ -602,17 +654,17 @@ export class DocRoom extends DurableObject {
    * @param {ArrayBuffer|string} message
    */
   async webSocketMessage(webSocket, message) {
-    const attachment = webSocket.deserializeAttachment();
-    if (!attachment?.docName
-      || !validBoundContext(attachment.docName, this.env, attachment.boundMode)) {
+    const {
+      docName, auth, authActions, boundMode, sourceInstance,
+    } = webSocket.deserializeAttachment() ?? {};
+    if (!docName || !validBoundContext(docName, this.env, boundMode, sourceInstance)) {
       webSocket.close(4412, 'reload required');
       return;
     }
-    const {
-      docName, auth, authActions, boundMode,
-    } = attachment;
     // eslint-disable-next-line no-param-reassign
     webSocket.boundMode = boundMode;
+    // eslint-disable-next-line no-param-reassign
+    webSocket.sourceInstance = sourceInstance;
     // eslint-disable-next-line no-param-reassign
     webSocket.auth = auth;
     if (!authActions.split(',').includes('write')) {
