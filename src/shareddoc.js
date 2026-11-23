@@ -20,7 +20,7 @@ import {
 import debounce from './debounce.js';
 import {
   HELIX6, LEGACY, fetchBoundSource, fetchBoundTransport, hasStrongEtag, readBoundAdmission,
-  readBoundBranchHead, readBoundSourceMode, readBranchSourceBaseline, resolveBoundSource,
+  readBoundSourceHead, readBoundSourceMode, readBranchSourceBaseline, resolveBoundSource,
   sourceError,
 } from './bound-source.js';
 
@@ -791,7 +791,11 @@ export const persistence = {
     if (ydoc.sourceInstance) {
       try {
         if (initialReq.ok) {
-          if (readRoomBranchEtag(ydoc, initialReq.headers) !== ydoc.sourceAdmissionEtag) {
+          const baseline = readBoundAdmission(initialReq.headers, {
+            branch: ydoc.boundBranch, isHelixAlias: true,
+          });
+          if (baseline.instance !== ydoc.sourceInstance
+            || baseline.etag !== ydoc.sourceAdmissionEtag) {
             throw sourceError(412, 'Bound Source branch validator changed');
           }
         } else if (isBranchUnavailable(initialReq.status)
@@ -806,9 +810,9 @@ export const persistence = {
       }
     } else if ((ydoc.boundMode || ydoc.boundBranch) && initialReq.ok) {
       try {
-        const mode = ydoc.boundBranch
-          ? readBoundAdmission(initialReq.headers, { branch: ydoc.boundBranch }).mode
-          : readBoundSourceMode(initialReq.headers, ydoc.boundMode === HELIX6);
+        const { mode } = readBoundAdmission(initialReq.headers, {
+          branch: ydoc.boundBranch, isHelixAlias: ydoc.boundMode === HELIX6,
+        });
         if (mode !== (ydoc.boundMode ?? LEGACY)) {
           throw sourceError(412, 'Bound Source mode changed; reload the document');
         }
@@ -1616,7 +1620,7 @@ async function retireObsoleteBranchRoom(doc, target, env, auth) {
   const generation = doc.saveGeneration;
   let latest;
   try {
-    latest = await readBoundBranchHead(target, env, auth);
+    latest = await readBoundSourceHead(target, env, auth);
   } catch {
     return; // A failed or unauthorized check isn't evidence against the current room.
   }
@@ -1627,10 +1631,10 @@ async function retireObsoleteBranchRoom(doc, target, env, auth) {
   }
 }
 
-async function revalidateWakingBranch(docName, target, env, conn, ctx, attached) {
+async function revalidateWakingBoundSource(docName, target, env, conn, ctx, attached) {
   let latest;
   try {
-    latest = await readBoundBranchHead(target, env, conn.auth);
+    latest = await readBoundSourceHead(target, env, conn.auth);
   } catch {
     // Pre-H6 DA attachments carry no mode. An unavailable trusted classifier
     // cannot distinguish an ordinary branch from one that now requires H6.
@@ -1703,8 +1707,10 @@ export const getYDoc = async (
   let admission = {
     mode: conn.boundMode ?? LEGACY, instance: conn.sourceInstance, etag: conn.sourceAdmissionEtag,
   };
-  if (branch && resuming && !docs.get(docname)?.conns.has(conn)) {
-    admission = await revalidateWakingBranch(docname, target, env, conn, ctx, attachment);
+  // An unregistered hibernated socket did not come through the edge's fresh HEAD.
+  if (target && (branch || conn.boundMode === HELIX6)
+    && resuming && !docs.get(docname)?.conns.has(conn)) {
+    admission = await revalidateWakingBoundSource(docname, target, env, conn, ctx, attachment);
     if (!admission) {
       return undefined;
     }

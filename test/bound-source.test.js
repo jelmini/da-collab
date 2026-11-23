@@ -18,6 +18,7 @@ import * as awareness from 'y-protocols/awareness.js';
 import { aem2doc, doc2aem } from '@adobe/da-parser';
 import {
   BOUND_SOURCE_ETAG, BOUND_SOURCE_INSTANCE, BOUND_SOURCE_MODE, fetchBoundSource,
+  SOURCE_COLLABORATION, SOURCE_CONTENT_PROFILE,
 } from '../src/bound-source.js';
 import edge, { DocRoom } from '../src/edge.js';
 import {
@@ -66,6 +67,10 @@ function sourceHeaders(source, showMode, overrides = {}) {
   }
   if (showMode && source.hint !== null) {
     headers.set('X-DA-Source-Mode', source.hint);
+    if (source.hint === 'helix6') {
+      headers.set(SOURCE_CONTENT_PROFILE, 'native-da');
+      headers.set(SOURCE_COLLABORATION, 'true');
+    }
   }
   if (source.unavailable !== undefined) {
     headers.set('X-DA-Source-Unavailable', source.unavailable);
@@ -94,6 +99,7 @@ function fixture(aliases = { da, h6, legacy }, extraSources = {}) {
   const calls = [];
   const rooms = new Map();
   const roomRequests = [];
+  const roomLookups = [];
   const env = {
     DA_RS_ORIGIN: origin,
     COLLAB_SHARED_SECRET: 'fixture-secret',
@@ -175,8 +181,12 @@ function fixture(aliases = { da, h6, legacy }, extraSources = {}) {
     },
   };
   env.rooms = {
-    idFromName: (name) => name,
+    idFromName(name) {
+      roomLookups.push(['idFromName', name]);
+      return name;
+    },
     get(name) {
+      roomLookups.push(['get', name]);
       if (!rooms.has(name)) {
         const data = new Map();
         const ctx = {
@@ -214,6 +224,7 @@ function fixture(aliases = { da, h6, legacy }, extraSources = {}) {
     calls,
     rooms,
     roomRequests,
+    roomLookups,
     open(target, authorization = token, headers = {}, params = '') {
       const query = `?Authorization=${encodeURIComponent(authorization)}${params}`;
       return edge.fetch(new Request(`https://collab.example/${target}${query}`, {
@@ -359,6 +370,104 @@ describe('Helix 6 Source on the configured da-rs binding', () => {
       .map((name) => invalidateFromAdmin(name, true)));
   });
 
+  for (const [kind, file, representation] of [
+    ['page', 'page.html', { ETag: null, 'Content-Type': 'text/html' }],
+    ['sheet', 'offers.json', {
+      ETag: '"sheet-bytes"', 'Content-Type': 'application/json', 'Content-Length': '246',
+    }],
+  ]) {
+    it(`denies imported ${kind} HEAD metadata on both aliases before room lookup`, async () => {
+      const daAlias = da.replace('page.html', file);
+      const direct = h6.replace('page.html', file);
+      const f = fixture({ da: daAlias, h6: direct });
+      f.source.headHeaders = {
+        ...representation,
+        'X-DA-Source-Kind': kind,
+        [SOURCE_CONTENT_PROFILE]: 'aem-import',
+        [SOURCE_COLLABORATION]: 'false',
+      };
+      const spoofed = { [SOURCE_CONTENT_PROFILE]: 'native-da', [SOURCE_COLLABORATION]: 'true' };
+      assert.equal((await f.open(direct, token, spoofed)).status, 403);
+      assert.equal((await f.open(daAlias, token, spoofed)).status, 403);
+      assert.deepEqual(f.calls.map(({ method, url }) => [method, url]), [
+        ['HEAD', direct], ['HEAD', daAlias],
+      ]);
+      assert.deepEqual(f.roomLookups, []);
+    });
+  }
+
+  for (const [profile, collaboration, status] of [
+    [null, null, 503],
+    [null, 'true', 503],
+    [null, 'false', 503],
+    ['native-da', null, 503],
+    ['native-da', 'false', 403],
+    ['aem-import', null, 503],
+    ['aem-import', 'true', 503],
+    ['aem-import', 'false', 403],
+    ['', 'true', 503],
+    ['unknown', 'true', 503],
+    ['Native-DA', 'true', 503],
+    ['native-da, native-da', 'true', 503],
+    ['native-da', 'TRUE', 503],
+    ['native-da', '', 503],
+    ['native-da', 'true, false', 503],
+  ]) {
+    it(`denies bound H6 profile=${profile}, collaboration=${collaboration}`, async () => {
+      const f = branchFixture();
+      const headers = {
+        [SOURCE_CONTENT_PROFILE]: profile, [SOURCE_COLLABORATION]: collaboration,
+      };
+      f.source.headHeaders = headers;
+      assert.equal((await f.open(draftDA)).status, status);
+      assert.equal((await f.open(draftH6)).status, status);
+      assert.deepEqual(f.calls.map(({ method, url }) => [method, url]), [
+        ['HEAD', draftDA], ['HEAD', draftH6],
+      ]);
+      assert.deepEqual(f.roomLookups, []);
+    });
+  }
+
+  it('does not treat an imported, mode-stripped DA alias as genuine legacy', async () => {
+    const f = fixture();
+    f.source.headHeaders = {
+      'X-DA-Source-Mode': null,
+      [SOURCE_CONTENT_PROFILE]: 'aem-import',
+      [SOURCE_COLLABORATION]: 'false',
+    };
+    assert.equal((await f.open(da)).status, 403);
+    assert.deepEqual(f.calls.map(({ method, url }) => [method, url]), [['HEAD', da]]);
+    assert.deepEqual(f.roomLookups, []);
+  });
+
+  it('preserves qualified imported unsupported-branch responses without trying Default', async () => {
+    const f = branchFixture();
+    f.source.headStatus = 422;
+    f.source.headHeaders = {
+      [SOURCE_CONTENT_PROFILE]: 'aem-import', [SOURCE_COLLABORATION]: 'false',
+    };
+    assert.equal((await f.open(draftDA)).status, 422);
+    assert.equal((await f.open(draftH6)).status, 422);
+    assert.deepEqual(f.calls.map(({ method, url }) => [method, url]), [
+      ['HEAD', draftDA], ['HEAD', draftH6],
+    ]);
+    assert.deepEqual(f.roomLookups, []);
+  });
+
+  it('does not replay a waking bare H6 socket into a cached room when collaboration is disabled', async () => {
+    const f = fixture();
+    const { conn, doc, room } = await f.connect(h6);
+    const waking = socket(conn.deserializeAttachment());
+    f.source.headHeaders = { [SOURCE_COLLABORATION]: 'false' };
+    await room.webSocketMessage(waking, editMessage(doc, 'Stale replay into a cached room'));
+    assert.equal(waking.closeCode, 4412);
+    assert.deepEqual(waking.sent, []);
+    assert.doesNotMatch(doc2aem(doc), /Stale replay/);
+    assert.deepEqual(f.calls.map(({ method, url }) => [method, url]), [
+      ['HEAD', h6], ['GET', h6], ['HEAD', da],
+    ]);
+  });
+
   it('authorizes both aliases, shares room and awareness, and flushes raw PUT with exact GET and PUT ETags', async () => {
     const f = fixture();
     const first = await f.connect(da);
@@ -366,6 +475,8 @@ describe('Helix 6 Source on the configured da-rs binding', () => {
       [BOUND_SOURCE_MODE]: 'legacy',
       'X-auth-actions': 'write',
       'X-collab-room': `${origin}/source/demo/work/spoof.html`,
+      [SOURCE_CONTENT_PROFILE]: 'aem-import',
+      [SOURCE_COLLABORATION]: 'false',
       Authorization: 'Bearer unrelated',
     });
     assert.equal(first.doc, second.doc);
@@ -380,6 +491,11 @@ describe('Helix 6 Source on the configured da-rs binding', () => {
       ['HEAD', da], ['GET', h6], ['HEAD', h6],
     ]);
     assert(f.roomRequests.every(({ request }) => request.url === da));
+    const forwarded = f.roomRequests.at(-1).request.headers;
+    assert.equal(forwarded.get(SOURCE_CONTENT_PROFILE), 'native-da');
+    assert.equal(forwarded.get(SOURCE_COLLABORATION), 'true');
+    assert.equal(f.calls[2].headers.get(SOURCE_CONTENT_PROFILE), null);
+    assert.equal(f.calls[2].headers.get(SOURCE_COLLABORATION), null);
     assert.equal(f.calls[0].headers.get('Authorization'), token);
     assert.equal(f.calls[2].headers.get('Authorization'), 'Bearer fixture-reader');
     await second.room.webSocketMessage(second.conn, awarenessMessage());
@@ -640,9 +756,14 @@ describe('Helix 6 Source on the configured da-rs binding', () => {
     const f = fixture({
       da, h6, legacy, branch, escapedLegacyBranch,
     }, { [branch]: qualifiedSource, [escapedLegacyBranch]: qualifiedSource });
-    const control = await f.connect(legacy);
+    const control = await f.connect(legacy, token, {
+      [SOURCE_CONTENT_PROFILE]: 'native-da', [SOURCE_COLLABORATION]: 'true',
+    });
     await Promise.all(control.ctx.pending);
     assert.equal(control.conn.deserializeAttachment().boundMode, 'legacy');
+    const forwarded = f.roomRequests.at(-1).request.headers;
+    assert.equal(forwarded.get(SOURCE_CONTENT_PROFILE), null);
+    assert.equal(forwarded.get(SOURCE_COLLABORATION), null);
     await control.room.webSocketMessage(control.conn, editMessage(control.doc, 'Unmarked control edit'));
     await flush(control.room, control.conn);
     const write = f.calls.at(-1);
@@ -1317,6 +1438,8 @@ describe('Helix 6 Source on the configured da-rs binding', () => {
     ['Content-Branch', 'sibling'],
     ['X-DA-Branch-Instance', nextInstance],
     ['X-DA-Source-Mode', null],
+    [SOURCE_CONTENT_PROFILE, null],
+    [SOURCE_COLLABORATION, 'false'],
     ['ETag', '"draft-item:2"'],
     ['ETag', 'W/"draft-item:1"'],
   ]) {

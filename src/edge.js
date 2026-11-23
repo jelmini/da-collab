@@ -14,7 +14,7 @@ import { DurableObject } from 'cloudflare:workers';
 import {
   BOUND_SOURCE_ETAG, BOUND_SOURCE_INSTANCE, BOUND_SOURCE_MODE, HELIX6, LEGACY, fetchBoundSource,
   hasBranchInstance, hasStrongEtag, isHelixSourcePath, readBoundAdmission, resolveBoundSource,
-  sourceError,
+  SOURCE_COLLABORATION, SOURCE_CONTENT_PROFILE, sourceError,
 } from './bound-source.js';
 import {
   getBackend, handleWebSocketClose, handleWebSocketMessage,
@@ -197,6 +197,8 @@ function roomRequestHeaders(request, docName, auth, authActions, admission, timi
   headers.delete(BOUND_SOURCE_MODE);
   headers.delete(BOUND_SOURCE_INSTANCE);
   headers.delete(BOUND_SOURCE_ETAG);
+  headers.delete(SOURCE_CONTENT_PROFILE);
+  headers.delete(SOURCE_COLLABORATION);
   headers.delete('X-DA-Branch-Instance');
   headers.delete('X-is-helix');
   headers.set('X-collab-room', docName);
@@ -209,6 +211,10 @@ function roomRequestHeaders(request, docName, auth, authActions, admission, timi
   }
   if (admission?.mode) {
     headers.set(BOUND_SOURCE_MODE, admission.mode);
+    if (admission.contentProfile) {
+      headers.set(SOURCE_CONTENT_PROFILE, admission.contentProfile);
+      headers.set(SOURCE_COLLABORATION, admission.collaboration);
+    }
     if (admission.instance) {
       headers.set(BOUND_SOURCE_INSTANCE, admission.instance);
       headers.set(BOUND_SOURCE_ETAG, admission.etag);

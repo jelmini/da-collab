@@ -13,6 +13,8 @@
 export const BOUND_SOURCE_MODE = 'X-Collab-Bound-Source-Mode';
 export const BOUND_SOURCE_INSTANCE = 'X-Collab-Bound-Source-Instance';
 export const BOUND_SOURCE_ETAG = 'X-Collab-Bound-Source-Etag';
+export const SOURCE_CONTENT_PROFILE = 'X-DA-Content-Profile';
+export const SOURCE_COLLABORATION = 'X-DA-Source-Collaboration';
 export const HELIX6 = 'helix6';
 export const LEGACY = 'legacy';
 const DA_SOURCE_PATH = /^\/source\/([^/]+)\/([^/]+)\/(.+)$/;
@@ -192,23 +194,43 @@ export function readBranchSourceBaseline(headers, branch) {
   return { instance, etag };
 }
 
+function readCollaborationMetadata(headers, mode) {
+  const contentProfile = headers.get(SOURCE_CONTENT_PROFILE);
+  const collaboration = headers.get(SOURCE_COLLABORATION);
+  // Only old, unmarked DA responses may omit the pair entirely.
+  if (mode === LEGACY && contentProfile === null && collaboration === null) {
+    return {};
+  }
+  if (!['aem-import', 'native-da'].includes(contentProfile)
+    || !['true', 'false'].includes(collaboration)
+    || (contentProfile === 'aem-import' && collaboration === 'true')) {
+    throw sourceError(503, 'Invalid bound Source collaboration metadata');
+  }
+  if (collaboration === 'false') {
+    // Being able to read a Source representation is not permission to open a room.
+    throw sourceError(403, 'Bound Source collaboration disabled');
+  }
+  return { contentProfile, collaboration };
+}
+
 export function readBoundAdmission(headers, target) {
   const mode = readBoundSourceMode(headers, target.isHelixAlias);
+  const metadata = readCollaborationMetadata(headers, mode);
   if (target.branch && mode === HELIX6) {
-    return { mode, ...readBranchSourceBaseline(headers, target.branch) };
+    return { mode, ...metadata, ...readBranchSourceBaseline(headers, target.branch) };
   }
   if (target.branch && headers.has('X-DA-Branch-Instance')) {
     throw sourceError(503, 'Bound Source branch instance without a Source mode');
   }
-  return { mode };
+  return { mode, ...metadata };
 }
 
-export async function readBoundBranchHead(target, env, auth) {
+export async function readBoundSourceHead(target, env, auth) {
   const headers = auth ? new Headers({ Authorization: auth }) : undefined;
   const response = await fetchBoundSource(env, target.requested, { method: 'HEAD', headers });
   await response.text();
   if (!response.ok) {
-    throw sourceError(response.status, 'Unable to revalidate bound Source branch');
+    throw sourceError(response.status, 'Unable to revalidate bound Source');
   }
   if (response.headers.get('X-DA-Source-Unavailable') === 'true') {
     return { unavailable: true };
